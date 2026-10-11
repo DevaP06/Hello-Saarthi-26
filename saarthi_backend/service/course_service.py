@@ -291,6 +291,15 @@ async def list_enrolled_courses(
     return await _dao_fn(db, user_id, limit=limit, offset=offset)
 
 
+async def list_owned_courses(
+    db: AsyncSession, owner_id: int, limit: int = 100, offset: int = 0
+) -> tuple[list[Course], int]:
+    """Return only courses created by this teacher (owner_id match)."""
+    items = await CourseDAO.list_by_owner(db, owner_id, limit=limit, offset=offset)
+    total = await CourseDAO.count_by_owner(db, owner_id)
+    return items, total
+
+
 # ----- Classroom invites -----
 
 _INVITE_CHARS = string.ascii_letters + string.digits
