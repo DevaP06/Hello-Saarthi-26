@@ -184,9 +184,11 @@ async def list_courses(
     db: Annotated[AsyncSession, Depends(get_db)],
     pagination: Annotated[PaginationParams, Depends(get_pagination)],
 ):
-    """List courses. Students see only enrolled courses; teachers/admins see all."""
-    if user.role in ("admin", "teacher"):
+    """List courses. Admins see all; teachers see only their own courses; students see only enrolled courses."""
+    if user.role == "admin":
         courses, total = await course_service.list_courses(db, limit=pagination.limit, offset=pagination.offset)
+    elif user.role == "teacher":
+        courses, total = await course_service.list_owned_courses(db, owner_id=user.id, limit=pagination.limit, offset=pagination.offset)
     else:
         courses, total = await course_service.list_enrolled_courses(db, user.id, limit=pagination.limit, offset=pagination.offset)
     return PaginatedResponse(
@@ -232,12 +234,19 @@ async def my_enrollments(
 @router.get("/{course_id}", response_model=CourseResponse)
 async def get_course(
     course_id: int,
+    user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Get course by id."""
+    """Get course by id. Teachers can only access their own courses; admins see all; students need enrollment."""
     course = await course_service.get_course(db, course_id)
     if not course:
         raise NotFoundError("Course not found.", details=None)
+    if user.role == "teacher" and course.owner_id != user.id:
+        raise ForbiddenError("You can only access courses you created.", details=None)
+    if user.role == "student":
+        enrollment = await course_service.get_enrollment(db, user.id, course_id)
+        if not enrollment:
+            raise ForbiddenError("You must be enrolled in this course to view it.", details=None)
     return _course_to_response(course)
 
 

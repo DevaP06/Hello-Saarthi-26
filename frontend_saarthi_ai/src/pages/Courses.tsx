@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { usePageTitle } from '../lib/usePageTitle';
 import {
     Search, Filter, Grid3X3, List, BookOpen, Clock, Users, Star,
-    ChevronDown, Plus, Edit3, Trash2, X, Save, BarChart3
+    ChevronDown, Plus, Edit3, Trash2, X, Save, BarChart3, LogIn
 } from 'lucide-react';
 import { useAuthStore } from '../stores/auth.store';
 import { api, type CourseResponse, type PaginatedResponse, type EnrollmentWithCourseResponse } from '../lib/api';
@@ -49,6 +50,7 @@ const difficulties = ['All', 'Beginner', 'Intermediate', 'Advanced'];
 const PAGE_SIZE = 20;
 
 export default function CoursesPage() {
+    usePageTitle('Courses');
     const { user } = useAuthStore();
     const isAdmin = user?.role === 'admin';
     const isInstructor = isAdmin || user?.role === 'teacher';
@@ -105,6 +107,30 @@ export default function CoursesPage() {
     const [showModal, setShowModal] = useState(false);
     const [editingCourse, setEditingCourse] = useState<CourseItem | null>(null);
     const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+
+    // Join with code (student)
+    const [showJoinModal, setShowJoinModal] = useState(false);
+    const [joinCode, setJoinCode] = useState('');
+    const [joinLoading, setJoinLoading] = useState(false);
+    const [joinError, setJoinError] = useState('');
+    const [joinSuccess, setJoinSuccess] = useState('');
+
+    const handleJoinCourse = async () => {
+        if (!joinCode.trim()) return;
+        setJoinLoading(true);
+        setJoinError('');
+        setJoinSuccess('');
+        try {
+            const res = await api.post<{ courseId: string; courseTitle: string; message: string }>('/courses/join', { inviteCode: joinCode.trim() });
+            setJoinSuccess(`You joined "${res.courseTitle}"! Refreshing...`);
+            setJoinCode('');
+            setTimeout(() => { setShowJoinModal(false); setJoinSuccess(''); window.location.reload(); }, 1800);
+        } catch (e) {
+            setJoinError(e instanceof Error ? e.message : 'Invalid or expired invite code.');
+        } finally {
+            setJoinLoading(false);
+        }
+    };
 
     // Form state
     const [formData, setFormData] = useState<Partial<CourseItem>>({});
@@ -204,11 +230,18 @@ export default function CoursesPage() {
                     <h1>Courses</h1>
                     <p>{isInstructor ? 'Manage and create courses' : 'Browse and enroll in courses'}</p>
                 </div>
-                {isInstructor && (
-                    <button className="btn btn-primary" onClick={openCreate}>
-                        <Plus size={18} /> Create Course
-                    </button>
-                )}
+                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    {!isInstructor && (
+                        <button className="btn btn-outline" onClick={() => { setShowJoinModal(true); setJoinError(''); setJoinSuccess(''); }}>
+                            <LogIn size={18} /> Join with Code
+                        </button>
+                    )}
+                    {isInstructor && (
+                        <button className="btn btn-primary" onClick={openCreate}>
+                            <Plus size={18} /> Create Course
+                        </button>
+                    )}
+                </div>
             </div>
 
             {/* Toolbar */}
@@ -408,6 +441,43 @@ export default function CoursesPage() {
                             <button className="btn btn-primary" onClick={handleSave}>
                                 <Save size={16} /> {editingCourse ? 'Update Course' : 'Create Course'}
                             </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+            {/* Join with Code Modal (student) */}
+            {showJoinModal && (
+                <div className="course-modal-overlay" onClick={() => setShowJoinModal(false)}>
+                    <div className="course-modal animate-scale-in" onClick={e => e.stopPropagation()} style={{ maxWidth: '420px' }}>
+                        <div className="course-modal-header">
+                            <h2><LogIn size={18} /> Join with Invite Code</h2>
+                            <button className="course-modal-close" onClick={() => setShowJoinModal(false)}><X size={20} /></button>
+                        </div>
+                        <div className="course-modal-body">
+                            <p style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', marginBottom: '1rem' }}>
+                                Enter the invite code your teacher shared with you.
+                            </p>
+                            <div className="course-modal-field">
+                                <label>Invite Code</label>
+                                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                                    <input
+                                        className="input"
+                                        placeholder="e.g. aB3xYz9Qr1"
+                                        value={joinCode}
+                                        onChange={e => setJoinCode(e.target.value)}
+                                        onKeyDown={e => e.key === 'Enter' && handleJoinCourse()}
+                                        autoFocus
+                                    />
+                                    <button className="btn btn-primary" onClick={handleJoinCourse} disabled={joinLoading || !joinCode.trim()}>
+                                        {joinLoading ? <span className="loading loading-spinner loading-sm"></span> : 'Join'}
+                                    </button>
+                                </div>
+                            </div>
+                            {joinError && <p style={{ color: 'var(--error)', fontSize: '0.8125rem', marginTop: '0.5rem' }}>{joinError}</p>}
+                            {joinSuccess && <p style={{ color: 'var(--accent)', fontSize: '0.875rem', fontWeight: 600, marginTop: '0.5rem' }}>{joinSuccess}</p>}
+                        </div>
+                        <div className="course-modal-footer">
+                            <button className="btn btn-outline" onClick={() => setShowJoinModal(false)}>Cancel</button>
                         </div>
                     </div>
                 </div>

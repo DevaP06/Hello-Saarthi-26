@@ -1,27 +1,15 @@
 import { useEffect, useState } from 'react';
 import {
     BookOpen, ClipboardList, BarChart3, Clock, Flame,
-    ArrowRight, ChevronRight, Sparkles, Play, FileText, Award
+    ChevronRight, CalendarDays, Loader2, RefreshCw,
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../stores/auth.store';
-import { api, type ProgressResponse, type EnrollmentWithCourseResponse, type PaginatedResponse } from '../lib/api';
+import { api, type ProgressResponse, type EnrollmentWithCourseResponse, type PaginatedResponse, type CourseResponse } from '../lib/api';
+import { usePageTitle } from '../lib/usePageTitle';
 import EmptyState from '../components/EmptyState';
 import './Dashboard.css';
 
-const deadlines = [
-    { id: 1, title: 'DSP Assignment #3 - FFT Implementation', course: 'Digital Signal Processing', due: '2026-02-14', urgency: 'high' as const, type: 'assignment' as const },
-    { id: 2, title: 'ML Quiz - Neural Networks', course: 'Machine Learning', due: '2026-02-15', urgency: 'high' as const, type: 'quiz' as const },
-    { id: 3, title: 'Binary Tree Problems Set', course: 'Data Structures', due: '2026-02-18', urgency: 'medium' as const, type: 'assignment' as const },
-    { id: 4, title: 'Pattern Recognition Report', course: 'Pattern Recognition', due: '2026-02-22', urgency: 'low' as const, type: 'assignment' as const },
-];
-
-const recommended = [
-    { id: 1, title: 'Fourier Transform Deep Dive', type: 'video', icon: Play, duration: '25 min' },
-    { id: 2, title: 'Gradient Descent Explained', type: 'note', icon: FileText, duration: '10 min read' },
-    { id: 3, title: 'Graph Algorithms Quiz', type: 'quiz', icon: Award, duration: '15 questions' },
-    { id: 4, title: 'Convolution Neural Networks', type: 'video', icon: Play, duration: '32 min' },
-];
 
 function getUrgencyInfo(urgency: string) {
     switch (urgency) {
@@ -32,13 +20,21 @@ function getUrgencyInfo(urgency: string) {
     }
 }
 
+interface StudyPlanDay { day: string; sessions: string[]; totalHours: number; }
+interface StudyPlan { weekPlan: StudyPlanDay[]; summary: string; priorityTopics: string[]; generatedAt: string; }
+
 export default function DashboardPage() {
+    usePageTitle('Dashboard');
     const { user } = useAuthStore();
     const navigate = useNavigate();
     const [progress, setProgress] = useState<ProgressResponse | null>(null);
     const [continueCourses, setContinueCourses] = useState<EnrollmentWithCourseResponse[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
+    const [studyPlan, setStudyPlan] = useState<StudyPlan | null>(null);
+    const [planLoading, setPlanLoading] = useState(false);
+    const [planExpanded, setPlanExpanded] = useState(false);
+    const [totalCourses, setTotalCourses] = useState(0);
 
     useEffect(() => {
         let cancelled = false;
@@ -46,13 +42,33 @@ export default function DashboardPage() {
             setLoading(true);
             setError(null);
             try {
-                const [progressRes, enrollmentsRes] = await Promise.all([
-                    api.get<ProgressResponse>('/users/me/progress'),
-                    api.get<PaginatedResponse<EnrollmentWithCourseResponse>>('/courses/my/enrollments', { limit: 5, offset: 0 }),
-                ]);
+                const isInst = user?.role === 'admin' || user?.role === 'teacher';
+                const progressPromise = api.get<ProgressResponse>('/users/me/progress');
+                
+                let coursesList: EnrollmentWithCourseResponse[] = [];
+                let tCourses = 0;
+                
+                if (isInst) {
+                    const coursesRes = await api.get<PaginatedResponse<CourseResponse>>('/courses', { limit: 5, offset: 0 });
+                    tCourses = coursesRes.total || coursesRes.items?.length || 0;
+                    coursesList = (coursesRes.items || []).map(c => ({
+                        id: c.id,
+                        courseId: c.id,
+                        progressPercent: 0,
+                        course: c
+                    } as EnrollmentWithCourseResponse));
+                } else {
+                    const enrollmentsRes = await api.get<PaginatedResponse<EnrollmentWithCourseResponse>>('/courses/my/enrollments', { limit: 5, offset: 0 });
+                    tCourses = enrollmentsRes.total || enrollmentsRes.items?.length || 0;
+                    coursesList = enrollmentsRes.items || [];
+                }
+                
+                const progressRes = await progressPromise;
+
                 if (!cancelled) {
                     setProgress(progressRes);
-                    setContinueCourses(enrollmentsRes.items || []);
+                    setContinueCourses(coursesList);
+                    setTotalCourses(tCourses);
                 }
             } catch (e) {
                 if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load dashboard');
@@ -61,20 +77,45 @@ export default function DashboardPage() {
             }
         })();
         return () => { cancelled = true; };
-    }, []);
+    }, [user?.role]);
+
+    const generateStudyPlan = async () => {
+        setPlanLoading(true);
+        try {
+            const courses = continueCourses.map((e) => ({
+                title: e.course.title,
+                code: e.course.code,
+                progressPercent: e.progressPercent,
+            }));
+            const plan = await api.post<StudyPlan>('/chat/study-plan', {
+                courses,
+                deadlines: [],
+                recentQuizScores: [],
+                hoursPerDay: 3,
+            });
+            setStudyPlan(plan);
+            setPlanExpanded(true);
+        } catch {
+            // silently fail — don't break the dashboard
+        } finally {
+            setPlanLoading(false);
+        }
+    };
+
+    const isInstructor = user?.role === 'admin' || user?.role === 'teacher';
 
     const statsCards = progress
         ? [
-            { label: 'Courses Enrolled', value: String(progress.coursesEnrolled), icon: BookOpen, color: '#8FA3C2', bg: 'rgba(143, 163, 194, 0.14)', change: '' },
-            { label: 'Pending Assignments', value: String(progress.pendingAssignments), icon: ClipboardList, color: '#9AA8BD', bg: 'rgba(154, 168, 189, 0.14)', change: progress.pendingAssignments > 0 ? 'Due' : '' },
-            { label: 'Avg Quiz Score', value: `${progress.avgQuizScorePercent}%`, icon: BarChart3, color: '#6EAFA4', bg: 'rgba(110, 175, 164, 0.14)', change: '' },
-            { label: 'Study Time', value: `${progress.studyTimeHours}h`, icon: Clock, color: '#8FA3C2', bg: 'rgba(143, 163, 194, 0.14)', change: 'Total' },
+            { label: isInstructor ? 'Courses Created' : 'Courses Enrolled', value: isInstructor ? String(totalCourses) : String(progress.coursesEnrolled), icon: BookOpen, color: '#0F766E', bg: 'rgba(15, 118, 110, 0.1)', change: '' },
+            { label: isInstructor ? 'Pending Grades' : 'Pending Assignments', value: isInstructor ? '–' : String(progress.pendingAssignments), icon: ClipboardList, color: '#9AA8BD', bg: 'rgba(154, 168, 189, 0.12)', change: (!isInstructor && progress.pendingAssignments > 0) ? 'Due' : '' },
+            { label: 'Avg Quiz Score', value: `${progress.avgQuizScorePercent}%`, icon: BarChart3, color: '#0F766E', bg: 'rgba(15, 118, 110, 0.1)', change: '' },
+            { label: 'Study Time', value: `${progress.studyTimeHours}h`, icon: Clock, color: '#9AA8BD', bg: 'rgba(154, 168, 189, 0.12)', change: 'Total' },
         ]
         : [
-            { label: 'Courses Enrolled', value: '–', icon: BookOpen, color: '#8FA3C2', bg: 'rgba(143, 163, 194, 0.14)', change: '' },
-            { label: 'Pending Assignments', value: '–', icon: ClipboardList, color: '#9AA8BD', bg: 'rgba(154, 168, 189, 0.14)', change: '' },
-            { label: 'Avg Quiz Score', value: '–', icon: BarChart3, color: '#6EAFA4', bg: 'rgba(110, 175, 164, 0.14)', change: '' },
-            { label: 'Study Time', value: '–', icon: Clock, color: '#8FA3C2', bg: 'rgba(143, 163, 194, 0.14)', change: '' },
+            { label: isInstructor ? 'Courses Created' : 'Courses Enrolled', value: '–', icon: BookOpen, color: '#0F766E', bg: 'rgba(15, 118, 110, 0.1)', change: '' },
+            { label: isInstructor ? 'Pending Grades' : 'Pending Assignments', value: '–', icon: ClipboardList, color: '#9AA8BD', bg: 'rgba(154, 168, 189, 0.12)', change: '' },
+            { label: 'Avg Quiz Score', value: '–', icon: BarChart3, color: '#0F766E', bg: 'rgba(15, 118, 110, 0.1)', change: '' },
+            { label: 'Study Time', value: '–', icon: Clock, color: '#9AA8BD', bg: 'rgba(154, 168, 189, 0.12)', change: '' },
         ];
 
     return (
@@ -87,14 +128,14 @@ export default function DashboardPage() {
             {/* Welcome Header */}
             <div className="dash-welcome animate-fade-in">
                 <div>
-                    <h1 className="dash-welcome-title">Welcome back, {user?.name || 'Student'}! 👋</h1>
-                    <p className="dash-welcome-sub">Let's continue your learning journey today</p>
+                    <h1 className="dash-welcome-title">Welcome back, {user?.name || 'Student'}</h1>
+                    <p className="dash-welcome-sub">Here's your learning overview for today</p>
                 </div>
                 <div className="dash-streak-card">
                     <Flame size={20} className="dash-streak-icon" />
                     <div>
                         <span className="dash-streak-value">{progress ? `${progress.streakDays} Day Streak` : '–'}</span>
-                        <span className="dash-streak-label">{progress?.streakDays ? 'Keep it up! 🔥' : 'Start studying to build a streak'}</span>
+                        <span className="dash-streak-label">{progress?.streakDays ? 'Current streak' : 'Start studying to build a streak'}</span>
                     </div>
                 </div>
             </div>
@@ -127,7 +168,7 @@ export default function DashboardPage() {
                 {/* Continue Learning */}
                 <div className="dash-section animate-fade-in delay-200">
                     <div className="dash-section-header">
-                        <h2>Continue Learning</h2>
+                        <h2>{isInstructor ? 'Your Courses' : 'Continue Learning'}</h2>
                         <button className="btn btn-ghost btn-sm" onClick={() => navigate('/courses')}>
                             View All <ChevronRight size={14} />
                         </button>
@@ -148,11 +189,11 @@ export default function DashboardPage() {
                         ) : continueCourses.length === 0 ? (
                             <EmptyState
                                 icon={<BookOpen size={28} />}
-                                title="No enrollments yet"
-                                description="Enroll in a course to continue your learning."
+                                title={isInstructor ? "No courses yet" : "No enrollments yet"}
+                                description={isInstructor ? "Create a course to get started." : "Enroll in a course to continue your learning."}
                                 action={
                                     <button type="button" className="btn btn-primary btn-sm" onClick={() => navigate('/courses')}>
-                                        Browse courses
+                                        {isInstructor ? "Manage courses" : "Browse courses"}
                                     </button>
                                 }
                             />
@@ -163,14 +204,20 @@ export default function DashboardPage() {
                                     <div className="dash-course-info">
                                         <h4>{e.course.title}</h4>
                                         <span className="dash-course-code">{e.course.code}</span>
-                                        <div className="progress-bar" style={{ marginTop: '0.5rem' }}>
-                                            <div className="progress-bar-fill" style={{ width: `${e.progressPercent}%` }} />
-                                        </div>
-                                        <div className="dash-course-meta">
-                                            <span>{e.progressPercent}% complete</span>
-                                        </div>
+                                        {!isInstructor && (
+                                            <>
+                                                <div className="progress-bar" style={{ marginTop: '0.5rem' }}>
+                                                    <div className="progress-bar-fill" style={{ width: `${e.progressPercent}%` }} />
+                                                </div>
+                                                <div className="dash-course-meta">
+                                                    <span>{e.progressPercent}% complete</span>
+                                                </div>
+                                            </>
+                                        )}
                                     </div>
-                                    <button className="btn btn-primary btn-sm" onClick={(ev) => { ev.stopPropagation(); navigate(`/courses/${e.courseId}`); }}>Resume</button>
+                                    <button className="btn btn-primary btn-sm" onClick={(ev) => { ev.stopPropagation(); navigate(`/courses/${e.courseId}`); }}>
+                                        {isInstructor ? 'Manage' : 'Resume'}
+                                    </button>
                                 </div>
                             ))
                         )}
@@ -183,50 +230,89 @@ export default function DashboardPage() {
                         <h2>Upcoming Deadlines</h2>
                     </div>
                     <div className="dash-deadlines">
-                        {deadlines.map((dl) => {
-                            const info = getUrgencyInfo(dl.urgency);
-                            return (
-                                <div key={dl.id} className="dash-deadline-item">
-                                    <div className="dash-deadline-icon" style={{ background: info.bg, color: info.color }}>
-                                        {dl.type === 'quiz' ? <Award size={18} /> : <ClipboardList size={18} />}
-                                    </div>
-                                    <div className="dash-deadline-info">
-                                        <h4>{dl.title}</h4>
-                                        <span>{dl.course}</span>
-                                    </div>
-                                    <div className="dash-deadline-due">
-                                        <span className="badge" style={{ background: info.bg, color: info.color }}>{info.label}</span>
-                                        <span className="dash-deadline-date">{new Date(dl.due).toLocaleDateString('en-IN', { month: 'short', day: 'numeric' })}</span>
-                                    </div>
-                                </div>
-                            );
-                        })}
+                        <EmptyState
+                            icon={<CalendarDays size={28} />}
+                            title="No upcoming deadlines"
+                            description="Deadlines from your enrolled courses will appear here."
+                        />
                     </div>
                 </div>
             </div>
 
-            {/* Recommended */}
-            <div className="dash-section animate-fade-in delay-400">
+            {/* Study Plan */}
+            <div className="dash-section dash-study-plan animate-fade-in delay-350">
                 <div className="dash-section-header">
-                    <h2><Sparkles size={20} style={{ color: 'var(--accent)' }} /> Recommended for You</h2>
-                    <button className="btn btn-ghost btn-sm">View All <ChevronRight size={14} /></button>
+                    <h2><CalendarDays size={20} style={{ color: 'var(--accent)' }} /> Study Plan</h2>
+                    <button
+                        className="btn btn-ghost btn-sm"
+                        onClick={generateStudyPlan}
+                        disabled={planLoading}
+                    >
+                        {planLoading
+                            ? <><Loader2 size={14} className="animate-spin" /> Generating...</>
+                            : studyPlan
+                                ? <><RefreshCw size={14} /> Regenerate</>
+                                : <><CalendarDays size={14} /> Generate Plan</>
+                        }
+                    </button>
                 </div>
-                <div className="dash-recommended">
-                    {recommended.map((item) => {
-                        const Icon = item.icon;
-                        return (
-                            <div key={item.id} className="dash-rec-card">
-                                <div className="dash-rec-icon"><Icon size={20} /></div>
-                                <h4>{item.title}</h4>
-                                <span className="dash-rec-meta">{item.duration}</span>
-                                <button className="btn btn-sm btn-secondary" style={{ marginTop: 'auto' }}>
-                                    Start <ArrowRight size={14} />
-                                </button>
+
+                {!studyPlan && !planLoading && (
+                    <div className="dash-plan-empty">
+                        <CalendarDays size={32} strokeWidth={1.2} />
+                        <p>Get a personalized 7-day study schedule based on your courses, deadlines, and quiz performance.</p>
+                        <button className="btn btn-primary btn-sm" onClick={generateStudyPlan}>
+                            <CalendarDays size={14} /> Generate My Study Plan
+                        </button>
+                    </div>
+                )}
+
+                {planLoading && (
+                    <div className="dash-plan-loading">
+                        <Loader2 size={20} className="animate-spin" />
+                        <span>Analyzing your progress and generating a personalized plan...</span>
+                    </div>
+                )}
+
+                {studyPlan && !planLoading && (
+                    <>
+                        {studyPlan.priorityTopics.length > 0 && (
+                            <div className="dash-plan-priorities">
+                                <span className="dash-plan-priority-label">Priority topics:</span>
+                                {studyPlan.priorityTopics.map((t, i) => (
+                                    <span key={i} className="badge badge-warning">{t}</span>
+                                ))}
                             </div>
-                        );
-                    })}
-                </div>
+                        )}
+                        <div className="dash-plan-days">
+                            {(planExpanded ? studyPlan.weekPlan : studyPlan.weekPlan.slice(0, 3)).map((day) => (
+                                <div key={day.day} className="dash-plan-day">
+                                    <div className="dash-plan-day-header">
+                                        <span className="dash-plan-day-name">{day.day}</span>
+                                        <span className="dash-plan-day-hours">{day.totalHours}h</span>
+                                    </div>
+                                    <ul className="dash-plan-sessions">
+                                        {day.sessions.map((s, i) => (
+                                            <li key={i}>{s}</li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            ))}
+                        </div>
+                        {studyPlan.weekPlan.length > 3 && (
+                            <button className="btn btn-ghost btn-sm dash-plan-toggle" onClick={() => setPlanExpanded((p) => !p)}>
+                                {planExpanded ? 'Show less' : `Show all ${studyPlan.weekPlan.length} days`} <ChevronRight size={14} style={{ transform: planExpanded ? 'rotate(270deg)' : 'rotate(90deg)', transition: 'transform 0.2s' }} />
+                            </button>
+                        )}
+                        {studyPlan.summary && (
+                            <p className="dash-plan-summary">{studyPlan.summary}</p>
+                        )}
+                    </>
+                )}
             </div>
+
+            {/* Study Plan */}
+
         </div>
     );
 }
