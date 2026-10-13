@@ -9,17 +9,33 @@ logger = logging.getLogger(__name__)
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from src.utils.llm import embeddings as make_embeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.vectorstores import VectorStoreRetriever
 from langchain_core.documents import Document
 
 KB_STATUS_FILE = "kb_status.json"
-EMBEDDING_MODEL = "configured-in-src.utils.llm"
+EMBEDDING_MODEL = "text-embedding-3-large"
 
 # TTL cache so check_and_update_kb_index doesn't do file I/O on every request
 _KB_CHECK_CACHE: dict[str, float] = {}
 _KB_CHECK_TTL = 60.0  # seconds
+
+# --- Unified knowledge base (content management pipeline) -----------------
+# Additive, opt-in retrieval path fed by scripts/build_knowledge_base.py.
+# Disabled by default (legacy per-agent knowledge_base/<expert>/vector_store
+# indexes above are unaffected) — set SAARTHI_USE_UNIFIED_KB=true to enable.
+# Only experts with a canonical ContentRecord.content_type mapping below are
+# ever routed to it; any other expert (e.g. books_agent, which this pipeline
+# does not ingest content for) always uses its legacy per-agent index.
+UNIFIED_KB_ENV_VAR = "SAARTHI_USE_UNIFIED_KB"
+UNIFIED_KB_PATH = Path("knowledge_base") / "unified" / "vector_store"
+UNIFIED_KB_MANIFEST_PATH = Path("knowledge_base") / "unified" / "manifest.json"
+
+_UNIFIED_CONTENT_TYPE_MAP: dict[str, set] = {
+    "notes_agent": {"handwritten_note", "pdf_note"},
+    "video_agent": {"video_transcript"},
+}
 
 def load_pdf_with_docling(file_path: str) -> List[Document]:
     """
@@ -52,16 +68,64 @@ def get_index_path(expert_name: str) -> Path:
     """Returns the path to the local vector store index."""
     return get_kb_path(expert_name) / "vector_store"
 
+def _unified_kb_enabled() -> bool:
+    return os.environ.get(UNIFIED_KB_ENV_VAR, "").strip().lower() in ("1", "true", "yes")
+
+
+def _unified_kb_embedding_model() -> str:
+    """Read the embedding model the unified index was actually built with, so query-time
+    embedding always matches — falls back to EMBEDDING_MODEL if no manifest is found."""
+    if UNIFIED_KB_MANIFEST_PATH.exists():
+        try:
+            manifest = json.loads(UNIFIED_KB_MANIFEST_PATH.read_text(encoding="utf-8"))
+            model = manifest.get("embedding_model")
+            if model:
+                return model
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Could not read unified KB manifest, defaulting embedding model: {e}")
+    return EMBEDDING_MODEL
+
+
+def get_unified_retriever(expert_name: str) -> Optional[VectorStoreRetriever]:
+    """Returns a retriever over the unified KB, scoped to this expert's content types.
+    Returns None if this expert has no unified content mapping or the index doesn't exist."""
+    allowed_types = _UNIFIED_CONTENT_TYPE_MAP.get(expert_name)
+    if not allowed_types or not UNIFIED_KB_PATH.exists():
+        return None
+
+    embeddings = OpenAIEmbeddings(model=_unified_kb_embedding_model())
+    try:
+        vector_store = FAISS.load_local(str(UNIFIED_KB_PATH), embeddings, allow_dangerous_deserialization=True)
+    except Exception as e:
+        logger.error(f"Error loading unified knowledge base: {e}")
+        return None
+
+    def _content_type_filter(metadata: dict) -> bool:
+        return metadata.get("content_type") in allowed_types
+
+    return vector_store.as_retriever(search_kwargs={"k": 5, "filter": _content_type_filter})
+
+
 def get_retriever(expert_name: str) -> Optional[VectorStoreRetriever]:
     """
     Loads the FAISS index and returns a retriever.
     Returns None if index doesn't exist.
+
+    When SAARTHI_USE_UNIFIED_KB is enabled and this expert has content in the
+    unified KB, that is preferred; otherwise falls back to the legacy
+    per-agent index below (unchanged default behavior).
     """
+    if _unified_kb_enabled():
+        unified_retriever = get_unified_retriever(expert_name)
+        if unified_retriever is not None:
+            return unified_retriever
+        logger.info(f"Unified KB enabled but unavailable for {expert_name}; falling back to legacy per-agent KB.")
+
     index_path = get_index_path(expert_name)
     if not index_path.exists():
         return None
         
-    embeddings = make_embeddings()
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
     try:
         vector_store = FAISS.load_local(
             str(index_path), 
@@ -123,7 +187,7 @@ def ingest_documents(expert_name: str) -> bool:
     
     # 3. Vectorize and Index
     logger.info(f"Embedding and indexing {expert_name}...")
-    embeddings = make_embeddings()
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
     vector_store = FAISS.from_documents(documents=splits, embedding=embeddings)
     
     # 4. Save Index
@@ -184,24 +248,22 @@ def check_and_update_kb_index(expert_name: str) -> bool:
             
     return False
 
-_EXPERT_DESCRIPTIONS = {
-    "notes_agent": "lecture notes and uploaded documents of the course",
-    "books_agent": "textbook theory: definitions, derivations, properties (signals, systems, DSP)",
-    "video_agent": "lecture video transcripts",
-    "calculator_agent": "numeric calculations",
-    "saarthi_agent": "greetings, small talk, what Saarthi can do, study planning — no course facts",
-    "data_analysis_agent": "analysing an uploaded CSV dataset (columns, statistics, plots)",
-    "web_agent": "current events outside the course (disabled unless ALLOW_WEB_AGENT=1)",
-}
-
-
 def get_expert_description(expert_name: str) -> str:
-    """One-line routing description per expert (kept short: prompt audit, WBS 3.3.5)."""
-    for key, desc in _EXPERT_DESCRIPTIONS.items():
-        if key in expert_name:
-            return desc
-    if "expert_1" in expert_name:
-        return _EXPERT_DESCRIPTIONS["notes_agent"]
-    if "expert_2" in expert_name:
-        return _EXPERT_DESCRIPTIONS["books_agent"]
+    """
+    Returns the description of the expert. 
+    """
+    if "expert_1" in expert_name or "notes_agent" in expert_name:
+        return "Notes Agent: Specialized in retrieving information from personal notes and documents. Use this when the user asks about meetings, specific personal details, or content from their uploaded notes."
+    if "expert_2" in expert_name or "books_agent" in expert_name:
+        return "Books Agent: Specialized in answering questions based on the books in the knowledge base. Use this for general knowledge, stories, or content likely found in books."
+    if "calculator_agent" in expert_name:
+        return "Calculator Agent: Specialized in performing mathematical calculations."
+    if "saarthi_agent" in expert_name:
+        return "Saarthi Agent: A general, friendly conversational assistant. Use this for greetings, small talk, questions about the user's identity (e.g., 'What is my name?'), referring to previous parts of this conversation, or queries that don't fit the specific Notes, Books, Calculator, or Video experts."
+    if "video_agent" in expert_name:
+        return "Video Agent: Specialized in answering questions from video lecture transcripts on signals and systems. Use this when the user asks about lecture content, concepts explained in video lectures, or video-based tutorials."
+    if "data_analysis_agent" in expert_name:
+        return "Data Analysis Agent: Specialized in analyzing uploaded CSV datasets using pandas and numpy. Use this when the user asks to analyze data, explore a dataset, compute statistics, filter rows, find correlations, or any data-related query. Also use this when the user mentions 'data', 'CSV', 'dataset', 'analyze', 'plot', 'statistics', 'columns', or 'rows'."
+    if "web_agent" in expert_name:
+        return "Web Agent: Searches the internet for up-to-date information. Use this ONLY when the topic is clearly outside the course materials — e.g., current events, general programming questions, or topics the other agents could not answer. Prefer course-specific agents first."
     return "General Assistant"
