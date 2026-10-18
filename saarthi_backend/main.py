@@ -112,6 +112,7 @@ async def lifespan(app: FastAPI):
     engine = create_async_engine(
         settings.database_url,
         echo=False,
+        connect_args={"statement_cache_size": 0},  # Neon pooler (PgBouncer) compat
     )
     if _DEV_AUTOCREATE_TABLES:
         async with engine.begin() as conn:
