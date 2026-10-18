@@ -8,6 +8,7 @@ import {
 import type { LucideIcon } from 'lucide-react';
 import './Sidebar.css';
 import { LogoIcon } from '../LogoIcon';
+import { useAuthStore } from '../../stores/auth.store';
 
 interface NavItem {
     path: string;
@@ -27,6 +28,12 @@ const DEFAULT_NAV_ITEMS: NavItem[] = [
     { path: '/study-material', label: 'Study Materials', icon: BookMarked },
 ];
 
+const TEACHER_NAV_ITEMS: NavItem[] = [
+    { path: '/progress', label: 'Class Analytics', icon: BarChart3 },
+    { path: '/courses', label: 'My Courses', icon: BookOpen },
+    { path: '/videos', label: 'Video Library', icon: Eye },
+];
+
 const ICON_MAP: Record<string, LucideIcon> = {
     '/dashboard': LayoutDashboard,
     '/courses': BookOpen,
@@ -40,14 +47,14 @@ const ICON_MAP: Record<string, LucideIcon> = {
 
 const STORAGE_KEY = 'saarthi-sidebar-order';
 
-function loadOrder(): NavItem[] {
+function loadOrder(defaults: NavItem[], key: string): NavItem[] {
     try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (!raw) return DEFAULT_NAV_ITEMS;
+        const raw = localStorage.getItem(key);
+        if (!raw) return defaults;
         const paths: string[] = JSON.parse(raw);
-        if (!Array.isArray(paths) || paths.length === 0) return DEFAULT_NAV_ITEMS;
+        if (!Array.isArray(paths) || paths.length === 0) return defaults;
 
-        const itemMap = new Map(DEFAULT_NAV_ITEMS.map((it) => [it.path, it]));
+        const itemMap = new Map(defaults.map((it) => [it.path, it]));
         const ordered: NavItem[] = [];
         for (const p of paths) {
             const item = itemMap.get(p);
@@ -62,13 +69,13 @@ function loadOrder(): NavItem[] {
         }
         return ordered;
     } catch {
-        return DEFAULT_NAV_ITEMS;
+        return defaults;
     }
 }
 
-function saveOrder(items: NavItem[]) {
+function saveOrder(items: NavItem[], key: string) {
     try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(items.map((i) => i.path)));
+        localStorage.setItem(key, JSON.stringify(items.map((i) => i.path)));
     } catch {
         // ignore storage errors
     }
@@ -81,16 +88,19 @@ const bottomItems = [
 export default function Sidebar() {
     const [collapsed, setCollapsed] = useState(false);
     const location = useLocation();
+    const isTeacher = useAuthStore((s) => s.user?.role) === 'teacher';
+    const orderKey = isTeacher ? `${STORAGE_KEY}-teacher` : STORAGE_KEY;
 
     // Draggable nav items
-    const [navItems, setNavItems] = useState<NavItem[]>(loadOrder);
+    const [navItems, setNavItems] = useState<NavItem[]>(() =>
+        loadOrder(isTeacher ? TEACHER_NAV_ITEMS : DEFAULT_NAV_ITEMS, orderKey));
     const dragIdx = useRef<number | null>(null);
     const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
 
     // Persist whenever navItems changes
     useEffect(() => {
-        saveOrder(navItems);
-    }, [navItems]);
+        saveOrder(navItems, orderKey);
+    }, [navItems, orderKey]);
 
     const handleDragStart = useCallback((idx: number) => {
         dragIdx.current = idx;
@@ -181,7 +191,7 @@ export default function Sidebar() {
 
                 {/* Bottom nav */}
                 <div className="sidebar-nav-bottom">
-                    {!collapsed && (
+                    {!collapsed && !isTeacher && (
                         <div className="sidebar-study-card">
                             <div className="sidebar-study-icon"><Flame size={18} /></div>
                             <div>

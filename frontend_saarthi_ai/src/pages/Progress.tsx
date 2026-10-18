@@ -1,5 +1,7 @@
 import { BarChart3, TrendingUp, Target, Clock, Award, BookOpen, Flame, Calendar, Trophy, MonitorPlay, CheckCircle2, TerminalSquare } from 'lucide-react';
 import './Progress.css';
+import { useAuthStore } from '../stores/auth.store';
+import TeacherAnalytics from './TeacherAnalytics';
 
 const weeklyData = [
     { day: 'Mon', hours: 2.5 }, { day: 'Tue', hours: 3.0 }, { day: 'Wed', hours: 1.5 },
@@ -25,6 +27,8 @@ const recentActivity = [
 const maxHours = Math.max(...weeklyData.map((d) => d.hours));
 
 export default function ProgressPage() {
+    const role = useAuthStore((s) => s.user?.role);
+    if (role === 'teacher') return <TeacherAnalytics />;
     return (
         <div className="progress-page">
             <div className="progress-header animate-fade-in">

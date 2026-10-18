@@ -42,17 +42,19 @@ function App() {
 
         {/* App Routes (with Sidebar + Topbar layout) */}
         <Route element={<ProtectedLayout />}>
-          <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="/dashboard" element={<StudentOnly><DashboardPage /></StudentOnly>} />
           <Route path="/courses" element={<CoursesPage />} />
+          <Route path="/join" element={<JoinRedirect />} />
+          <Route path="/courses/join" element={<JoinRedirect />} />
           <Route path="/courses/:id" element={<CourseDetailPage />} />
-          <Route path="/chat" element={<ChatPage />} />
-          <Route path="/quiz" element={<QuizPage />} />
-          <Route path="/code-lab" element={<CodeLabPage />} />
+          <Route path="/chat" element={<StudentOnly><ChatPage /></StudentOnly>} />
+          <Route path="/quiz" element={<StudentOnly><QuizPage /></StudentOnly>} />
+          <Route path="/code-lab" element={<StudentOnly><CodeLabPage /></StudentOnly>} />
           <Route path="/videos" element={<VideosPage />} />
           <Route path="/videos/:id" element={<VideoPlayerPage />} />
           <Route path="/progress" element={<ProgressPage />} />
           <Route path="/notes" element={<Navigate to="/study-material" replace />} />
-          <Route path="/study-material" element={<StudyMaterialPage />} />
+          <Route path="/study-material" element={<StudentOnly><StudyMaterialPage /></StudentOnly>} />
           <Route path="/search" element={<SearchPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Route>
@@ -84,8 +86,23 @@ function PublicOnly({ children }: { children: ReactElement }) {
   return children;
 }
 
+/** Invite links (/join?code=…) hand the code to the Courses page, which joins automatically. */
+function JoinRedirect() {
+  const { search } = useLocation();
+  return <Navigate to={`/courses${search}`} replace />;
+}
+
+/** Student-only pages: teachers land on their class analytics instead. */
+function StudentOnly({ children }: { children: ReactElement }) {
+  const role = useAuthStore((s) => s.user?.role);
+  if (role === 'teacher') return <Navigate to="/progress" replace />;
+  return children;
+}
+
 function GlobalChatbot() {
   const location = useLocation();
+  const role = useAuthStore((s) => s.user?.role);
+  if (role === 'teacher') return null;
   if (location.pathname === '/login' || location.pathname === '/signup') return null;
   return <AIChatbot />;
 }
