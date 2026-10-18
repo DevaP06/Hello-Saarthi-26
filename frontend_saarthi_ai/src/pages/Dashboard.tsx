@@ -204,16 +204,6 @@ export default function DashboardPage() {
                                     <div className="dash-course-info">
                                         <h4>{e.course.title}</h4>
                                         <span className="dash-course-code">{e.course.code}</span>
-                                        {!isInstructor && (
-                                            <>
-                                                <div className="progress-bar" style={{ marginTop: '0.5rem' }}>
-                                                    <div className="progress-bar-fill" style={{ width: `${e.progressPercent}%` }} />
-                                                </div>
-                                                <div className="dash-course-meta">
-                                                    <span>{e.progressPercent}% complete</span>
-                                                </div>
-                                            </>
-                                        )}
                                     </div>
                                     <button className="btn btn-primary btn-sm" onClick={(ev) => { ev.stopPropagation(); navigate(`/courses/${e.courseId}`); }}>
                                         {isInstructor ? 'Manage' : 'Resume'}

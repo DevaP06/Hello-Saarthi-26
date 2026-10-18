@@ -54,6 +54,8 @@ class AssignmentResponse(BaseModel):
     topic: Optional[str] = None
     attachments: Optional[str] = None
     createdAt: str
+    status: str = "pending"  # the requesting student's own submission status
+    grade: Optional[float] = None
 
     class Config:
         populate_by_name = True
@@ -130,6 +132,19 @@ class StreamItemCreate(BaseModel):
     description: str = Field(..., min_length=1)
     type: str = "announcement"
     title: Optional[str] = None
+
+
+class StreamCommentCreate(BaseModel):
+    body: str = Field(..., min_length=1, max_length=2000)
+
+
+class StreamCommentResponse(BaseModel):
+    id: str
+    streamItemId: str
+    userId: str
+    author: str
+    body: str
+    createdAt: str
 
 
 class StreamItemUpdate(BaseModel):

@@ -32,11 +32,14 @@ from saarthi_backend.schema.course_schemas import (
     MaterialUpdate,
     SearchItem,
     SearchResponse,
+    StreamCommentCreate,
+    StreamCommentResponse,
     StreamItemCreate,
     StreamItemResponse,
     StreamItemUpdate,
 )
 from saarthi_backend.schema.common_schemas import PaginatedResponse, PaginationParams
+from saarthi_backend.dao.course_dao import StreamCommentDAO
 from saarthi_backend.service import course_service
 from saarthi_backend.utils.exceptions import ForbiddenError, NotFoundError, ValidationError
 from saarthi_backend.utils.logging import get_logger
@@ -71,8 +74,10 @@ def _course_to_response(c):
     )
 
 
-def _assignment_to_response(a):
+def _assignment_to_response(a, submission=None):
     return AssignmentResponse(
+        status=submission.status if submission else "pending",
+        grade=submission.grade if submission else None,
         id=str(a.id),
         courseId=str(a.course_id),
         title=a.title,
@@ -370,6 +375,8 @@ async def invite_student(
     course = await course_service.get_course(db, course_id)
     if not course:
         raise NotFoundError("Course not found.", details=None)
+    if user.role != "admin" and course.owner_id != user.id:
+        raise ForbiddenError("You can only manage invites for your own courses.", details=None)
     invite = await course_service.create_invite(
         db, course_id=course_id, invited_by=user.id, email=body.email
     )
@@ -409,6 +416,8 @@ async def list_invites(
     course = await course_service.get_course(db, course_id)
     if not course:
         raise NotFoundError("Course not found.", details=None)
+    if user.role != "admin" and course.owner_id != user.id:
+        raise ForbiddenError("You can only manage invites for your own courses.", details=None)
     invites = await course_service.list_course_invites(db, course_id)
     return [
         InviteListItem(
@@ -464,15 +473,21 @@ async def join_course(
 @router.get("/{course_id}/assignments", response_model=PaginatedResponse[AssignmentResponse])
 async def list_assignments(
     course_id: int,
+    user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
     pagination: Annotated[PaginationParams, Depends(get_pagination)],
 ):
-    """List assignments for a course (paginated)."""
+    """List assignments for a course (paginated). Members only; students also get their own submission status."""
+    await _course_for_member(db, user, course_id)
     assignments, total = await course_service.list_assignments(
         db, course_id, limit=pagination.limit, offset=pagination.offset
     )
+    subs = {}
+    if user.role == "student":
+        for a in assignments:
+            subs[a.id] = await course_service.get_submission(db, user.id, a.id)
     return PaginatedResponse(
-        items=[_assignment_to_response(a) for a in assignments],
+        items=[_assignment_to_response(a, subs.get(a.id)) for a in assignments],
         total=total,
         limit=pagination.limit,
         offset=pagination.offset,
@@ -486,12 +501,11 @@ async def create_assignment(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Create assignment (admin/teacher)."""
-    if user.role not in ("admin", "teacher"):
-        raise ValidationError("Forbidden.", details=None)
+    """Create assignment (the course's teacher or admin)."""
     course = await course_service.get_course(db, course_id)
     if not course:
         raise NotFoundError("Course not found.", details=None)
+    _require_course_owner(user, course)
     a = await course_service.create_assignment(
         db,
         course_id=course_id,
@@ -522,9 +536,11 @@ async def update_assignment(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Update assignment (admin/teacher)."""
-    if user.role not in ("admin", "teacher"):
-        raise ValidationError("Forbidden.", details=None)
+    """Update assignment (the course's teacher or admin)."""
+    course = await course_service.get_course(db, course_id)
+    if not course:
+        raise NotFoundError("Course not found.", details=None)
+    _require_course_owner(user, course)
     assignment = await course_service.get_assignment(db, assignment_id)
     if not assignment or assignment.course_id != course_id:
         raise NotFoundError("Assignment not found.", details=None)
@@ -549,9 +565,11 @@ async def delete_assignment(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Delete assignment (admin/teacher)."""
-    if user.role not in ("admin", "teacher"):
-        raise ValidationError("Forbidden.", details=None)
+    """Delete assignment (the course's teacher or admin)."""
+    course = await course_service.get_course(db, course_id)
+    if not course:
+        raise NotFoundError("Course not found.", details=None)
+    _require_course_owner(user, course)
     assignment = await course_service.get_assignment(db, assignment_id)
     if not assignment or assignment.course_id != course_id:
         raise NotFoundError("Assignment not found.", details=None)
@@ -568,6 +586,7 @@ async def submit_assignment(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Submit assignment for current user."""
+    await _course_for_member(db, user, course_id)
     assignment = await course_service.get_assignment(db, assignment_id)
     if not assignment or assignment.course_id != course_id:
         raise NotFoundError("Assignment not found.", details=None)
@@ -898,13 +917,43 @@ async def get_material_file(
 
 
 # ----- Stream -----
+async def _course_for_member(db: AsyncSession, user: User, course_id: int):
+    """Course if the user may read its stream (owner, admin or enrolled student); else 404/403."""
+    course = await course_service.get_course(db, course_id)
+    if not course:
+        raise NotFoundError("Course not found.", details=None)
+    if user.role == "admin" or course.owner_id == user.id:
+        return course
+    if user.role == "student" and await course_service.get_enrollment(db, user.id, course_id):
+        return course
+    raise ForbiddenError("Join this course to see its stream.", details=None)
+
+
+def _require_course_owner(user: User, course) -> None:
+    if user.role != "admin" and not (user.role == "teacher" and course.owner_id == user.id):
+        raise ForbiddenError("Only the course teacher can post, edit or delete announcements.", details=None)
+
+
+def _comment_to_response(c):
+    return StreamCommentResponse(
+        id=str(c.id),
+        streamItemId=str(c.stream_item_id),
+        userId=str(c.user_id),
+        author=c.author,
+        body=c.body,
+        createdAt=c.created_at.isoformat() if c.created_at else "",
+    )
+
+
 @router.get("/{course_id}/stream", response_model=PaginatedResponse[StreamItemResponse])
 async def list_stream(
     course_id: int,
+    user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
     pagination: Annotated[PaginationParams, Depends(get_pagination)],
 ):
-    """List stream/announcements for a course (paginated)."""
+    """List stream/announcements for a course (paginated). Members only."""
+    await _course_for_member(db, user, course_id)
     items, total = await course_service.list_stream_items(
         db, course_id, limit=pagination.limit, offset=pagination.offset
     )
@@ -923,12 +972,11 @@ async def create_stream_item(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Create announcement (admin/teacher)."""
-    if user.role not in ("admin", "teacher"):
-        raise ValidationError("Forbidden.", details=None)
+    """Create announcement (the course's teacher or admin)."""
     course = await course_service.get_course(db, course_id)
     if not course:
         raise NotFoundError("Course not found.", details=None)
+    _require_course_owner(user, course)
     s = await course_service.create_stream_item(
         db,
         course_id=course_id,
@@ -949,9 +997,11 @@ async def update_stream_item(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Update stream item (admin/teacher)."""
-    if user.role not in ("admin", "teacher"):
-        raise ValidationError("Forbidden.", details=None)
+    """Update stream item (the course's teacher or admin)."""
+    course = await course_service.get_course(db, course_id)
+    if not course:
+        raise NotFoundError("Course not found.", details=None)
+    _require_course_owner(user, course)
     item = await course_service.get_stream_item(db, item_id)
     if not item or item.course_id != course_id:
         raise NotFoundError("Stream item not found.", details=None)
@@ -969,13 +1019,70 @@ async def delete_stream_item(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Delete stream item (admin/teacher)."""
-    if user.role not in ("admin", "teacher"):
-        raise ValidationError("Forbidden.", details=None)
+    """Delete stream item (the course's teacher or admin)."""
+    course = await course_service.get_course(db, course_id)
+    if not course:
+        raise NotFoundError("Course not found.", details=None)
+    _require_course_owner(user, course)
     item = await course_service.get_stream_item(db, item_id)
     if not item or item.course_id != course_id:
         raise NotFoundError("Stream item not found.", details=None)
     await course_service.delete_stream_item(db, item_id)
+    await db.commit()
+
+
+# ----- Stream comments (students and the teacher can comment; only the teacher posts) -----
+@router.get("/{course_id}/stream/{item_id}/comments", response_model=list[StreamCommentResponse])
+async def list_stream_comments(
+    course_id: int,
+    item_id: int,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await _course_for_member(db, user, course_id)
+    item = await course_service.get_stream_item(db, item_id)
+    if not item or item.course_id != course_id:
+        raise NotFoundError("Stream item not found.", details=None)
+    return [_comment_to_response(c) for c in await StreamCommentDAO.list_by_item(db, item_id)]
+
+
+@router.post(
+    "/{course_id}/stream/{item_id}/comments",
+    response_model=StreamCommentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_stream_comment(
+    course_id: int,
+    item_id: int,
+    body: StreamCommentCreate,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await _course_for_member(db, user, course_id)
+    item = await course_service.get_stream_item(db, item_id)
+    if not item or item.course_id != course_id:
+        raise NotFoundError("Stream item not found.", details=None)
+    c = await StreamCommentDAO.create(db, item_id, user.id, user.full_name, body.body.strip())
+    await db.commit()
+    return _comment_to_response(c)
+
+
+@router.delete("/{course_id}/stream/{item_id}/comments/{comment_id}", status_code=204)
+async def delete_stream_comment(
+    course_id: int,
+    item_id: int,
+    comment_id: int,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Delete a comment: its author, the course's teacher, or an admin."""
+    course = await _course_for_member(db, user, course_id)
+    comment = await StreamCommentDAO.get_by_id(db, comment_id)
+    if not comment or comment.stream_item_id != item_id:
+        raise NotFoundError("Comment not found.", details=None)
+    if comment.user_id != user.id and user.role != "admin" and course.owner_id != user.id:
+        raise ForbiddenError("You can only delete your own comments.", details=None)
+    await StreamCommentDAO.delete(db, comment)
     await db.commit()
 
 

@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { usePageTitle } from '../lib/usePageTitle';
 import {
-    Search, Filter, Grid3X3, List, BookOpen, Clock, Users, Star,
-    ChevronDown, Plus, Edit3, Trash2, X, Save, BarChart3, LogIn
+    Search, Filter, Grid3X3, List, BookOpen,
+    ChevronDown, Plus, Edit3, Trash2, X, Save, LogIn
 } from 'lucide-react';
 import { useAuthStore } from '../stores/auth.store';
 import { api, type CourseResponse, type PaginatedResponse, type EnrollmentWithCourseResponse } from '../lib/api';
@@ -68,6 +68,7 @@ export default function CoursesPage() {
     const [showFilters, setShowFilters] = useState(false);
     const navigate = useNavigate();
     const toast = useToast();
+    const [searchParams, setSearchParams] = useSearchParams();
 
     useEffect(() => {
         let cancelled = false;
@@ -92,17 +93,6 @@ export default function CoursesPage() {
         return () => { cancelled = true; };
     }, [offset]);
 
-    const handleEnroll = async (courseId: string) => {
-        try {
-            await api.post(`/courses/${courseId}/enroll`);
-            setEnrolledIds((prev) => ({ ...prev, [courseId]: 0 }));
-            setCourses((prev) => prev.map((c) => (c.id === courseId ? { ...c, progress: 0 } : c)));
-            toast.showToast('Enrolled successfully');
-        } catch (e) {
-            toast.showToast(e instanceof Error ? e.message : 'Enroll failed', 'error');
-        }
-    };
-
     // Modal state
     const [showModal, setShowModal] = useState(false);
     const [editingCourse, setEditingCourse] = useState<CourseItem | null>(null);
@@ -114,6 +104,16 @@ export default function CoursesPage() {
     const [joinLoading, setJoinLoading] = useState(false);
     const [joinError, setJoinError] = useState('');
     const [joinSuccess, setJoinSuccess] = useState('');
+
+    // Invite links land here as /courses?code=XXXX: open the join dialog with the code filled in.
+    useEffect(() => {
+        const code = searchParams.get('code');
+        if (!code || isInstructor) return;
+        setJoinCode(code);
+        setShowJoinModal(true);
+        setSearchParams({}, { replace: true });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     const handleJoinCourse = async () => {
         if (!joinCode.trim()) return;
@@ -136,6 +136,7 @@ export default function CoursesPage() {
     const [formData, setFormData] = useState<Partial<CourseItem>>({});
 
     const filtered = courses.filter((c) => {
+        if (!isInstructor && enrolledIds[c.id] === undefined) return false;
         const matchSearch = !search.trim() || c.title.toLowerCase().includes(search.toLowerCase()) || c.code.toLowerCase().includes(search.toLowerCase());
         const matchCat = category === 'All' || c.category === category;
         const matchDiff = difficulty === 'All' || c.difficulty === difficulty;
@@ -228,7 +229,7 @@ export default function CoursesPage() {
             <div className="courses-header">
                 <div>
                     <h1>Courses</h1>
-                    <p>{isInstructor ? 'Manage and create courses' : 'Browse and enroll in courses'}</p>
+                    <p>{isInstructor ? 'Manage and create courses' : 'Your courses — join a new one with a class code'}</p>
                 </div>
                 <div style={{ display: 'flex', gap: '0.5rem' }}>
                     {!isInstructor && (
@@ -310,32 +311,10 @@ export default function CoursesPage() {
                         <div className="course-card-body">
                             <div className="course-card-top">
                                 <span className="course-card-code">{course.code}</span>
-                                <div className="course-card-rating"><Star size={12} fill="var(--text-muted)" stroke="var(--text-muted)" /> {course.rating}</div>
                             </div>
                             <h3 className="course-card-title">{course.title}</h3>
                             <p className="course-card-instructor">{course.instructor}</p>
                             {viewMode === 'list' && <p className="course-card-desc">{course.description}</p>}
-                            <div className="course-card-meta">
-                                <span><BookOpen size={14} /> {course.lessons} lessons</span>
-                                <span><Clock size={14} /> {course.duration}</span>
-                                <span><Users size={14} /> {course.students}</span>
-                            </div>
-                            {/* Progress bar for students */}
-                            {!isInstructor && course.progress > 0 && (
-                                <div className="course-card-progress">
-                                    <div className="course-card-progress-bar">
-                                        <div className="course-card-progress-fill" style={{ width: `${course.progress}%` }} />
-                                    </div>
-                                    <span>{course.progress}%</span>
-                                </div>
-                            )}
-                            {/* Student stats for admin */}
-                            {isInstructor && (
-                                <div className="course-card-admin-stats">
-                                    <span><BarChart3 size={14} /> {course.students} enrolled</span>
-                                    <span>⭐ {course.rating}/5</span>
-                                </div>
-                            )}
                             <div className="course-card-footer">
                                 {isInstructor ? (
                                     <div className="course-card-admin-actions">
@@ -353,13 +332,9 @@ export default function CoursesPage() {
                                 ) : (
                                     <button
                                         className="btn btn-primary btn-sm"
-                                        onClick={(ev) => {
-                                            ev.stopPropagation();
-                                            if (enrolledIds[course.id] !== undefined) navigate(`/courses/${course.id}`);
-                                            else handleEnroll(course.id);
-                                        }}
+                                        onClick={(ev) => { ev.stopPropagation(); navigate(`/courses/${course.id}`); }}
                                     >
-                                        {enrolledIds[course.id] !== undefined ? 'Continue' : 'Enroll'}
+                                        Continue
                                     </button>
                                 )}
                             </div>
@@ -373,7 +348,7 @@ export default function CoursesPage() {
                 <div className="courses-empty">
                     <BookOpen size={48} />
                     <h3>No courses found</h3>
-                    <p>Try adjusting your search or filters</p>
+                    <p>{isInstructor ? 'Try adjusting your search or filters' : 'Enter the class code from your teacher above to join a course'}</p>
                 </div>
             )}
             {!loading && total > 0 && (

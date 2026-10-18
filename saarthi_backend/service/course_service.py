@@ -167,6 +167,12 @@ async def delete_assignment(db: AsyncSession, assignment_id: int) -> bool:
     return await AssignmentDAO.delete(db, assignment_id)
 
 
+async def get_submission(
+    db: AsyncSession, user_id: int, assignment_id: int
+) -> AssignmentSubmission | None:
+    return await AssignmentSubmissionDAO.get(db, user_id, assignment_id)
+
+
 async def submit_assignment(
     db: AsyncSession,
     user_id: int,
@@ -314,13 +320,14 @@ async def create_invite(
     course_id: int,
     invited_by: int,
     email: str,
-    expires_in_hours: int = 72,
+    expires_in_hours: int | None = None,
 ) -> ClassroomInvite:
     invite_code = _generate_invite_code()
+    hours = expires_in_hours or 72
     if email.strip() == "*":
         # Open class code shared with the whole class: give it a useful lifetime.
-        expires_in_hours = max(expires_in_hours, 30 * 24)
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)
+        hours = max(hours, 30 * 24)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=hours)
     invite = await ClassroomInviteDAO.create(
         db,
         course_id=course_id,
