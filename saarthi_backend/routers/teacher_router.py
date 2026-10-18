@@ -16,12 +16,15 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from saarthi_backend.deps import get_current_user, get_db
 from saarthi_backend.model import User
-from saarthi_backend.model.course_model import Course, Material, Assignment
+from saarthi_backend.model.course_model import (
+    Assignment, AssignmentSubmission, Course, Enrollment, Material,
+)
+from saarthi_backend.model.quiz_model import Quiz, QuizAttempt
 from saarthi_backend.service import course_service
 from saarthi_backend.service.indexing_service import index_material_background
 
@@ -712,3 +715,88 @@ async def teacher_courses(
     )
     courses = result.scalars().all()
     return [{"id": str(c.id), "title": c.title, "code": c.code} for c in courses]
+
+
+# ── Endpoint 4: Class-level analytics ───────────────────────────────────────
+
+def _r(v: float | None, n: int = 1) -> float | None:
+    return None if v is None else round(float(v), n)
+
+
+@router.get("/analytics")
+async def teacher_analytics(
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Per-course enrollments, quiz averages and weak topics for the teacher's own courses (admin: all)."""
+    _require_teacher(user)
+    q = select(Course).order_by(Course.created_at.desc())
+    if user.role != "admin":
+        q = q.where(Course.owner_id == user.id)
+    courses = (await db.execute(q)).scalars().all()
+    ids = [c.id for c in courses]
+    if not ids:
+        return {"summary": {"courses": 0, "students": 0, "quizAttempts": 0, "avgQuizScore": None},
+                "courses": [], "weakTopics": []}
+
+    enr = {
+        r.course_id: r for r in (await db.execute(
+            select(Enrollment.course_id, func.count().label("n"))
+            .where(Enrollment.course_id.in_(ids)).group_by(Enrollment.course_id)
+        )).all()
+    }
+    students = (await db.execute(
+        select(func.count(func.distinct(Enrollment.user_id))).where(Enrollment.course_id.in_(ids))
+    )).scalar_one()
+
+    # Quiz attempts: scores are stored as percentages (passing_score is a percentage too).
+    quiz_rows = (await db.execute(
+        select(Quiz.id, Quiz.title, Quiz.course_id, Quiz.passing_score,
+               func.count(QuizAttempt.id).label("n"), func.avg(QuizAttempt.score).label("avg"))
+        .join(QuizAttempt, QuizAttempt.quiz_id == Quiz.id)
+        .where(Quiz.course_id.in_(ids), QuizAttempt.submitted_at.is_not(None), QuizAttempt.score.is_not(None))
+        .group_by(Quiz.id)
+    )).all()
+
+    # Assignment grades by topic, as % of the assignment's points.
+    topic_rows = (await db.execute(
+        select(Assignment.course_id, Assignment.topic,
+               func.count(AssignmentSubmission.id).label("n"),
+               func.avg(AssignmentSubmission.grade * 100.0 / func.nullif(Assignment.points, 0)).label("avg"))
+        .join(AssignmentSubmission, AssignmentSubmission.assignment_id == Assignment.id)
+        .where(Assignment.course_id.in_(ids), Assignment.topic.is_not(None),
+               AssignmentSubmission.grade.is_not(None))
+        .group_by(Assignment.course_id, Assignment.topic)
+    )).all()
+
+    title = {c.id: c.title for c in courses}
+    weak = [
+        {"topic": r.topic, "course": title[r.course_id], "avgPercent": _r(r.avg), "samples": r.n, "source": "assignment"}
+        for r in topic_rows if r.avg is not None
+    ] + [
+        {"topic": r.title, "course": title[r.course_id], "avgPercent": _r(r.avg), "samples": r.n, "source": "quiz"}
+        for r in quiz_rows if r.avg is not None
+    ]
+    weak.sort(key=lambda w: w["avgPercent"])
+
+    out = []
+    for c in courses:
+        qs = [r for r in quiz_rows if r.course_id == c.id]
+        attempts = sum(r.n for r in qs)
+        out.append({
+            "id": str(c.id), "title": c.title, "code": c.code,
+            "enrollments": enr[c.id].n if c.id in enr else 0,
+            "quizAttempts": attempts,
+            "avgQuizScore": _r(sum(r.avg * r.n for r in qs) / attempts) if attempts else None,
+            "quizzes": [{"title": r.title, "attempts": r.n, "avgScore": _r(r.avg), "passingScore": r.passing_score} for r in qs],
+        })
+    total_attempts = sum(c["quizAttempts"] for c in out)
+    return {
+        "summary": {
+            "courses": len(out), "students": students, "quizAttempts": total_attempts,
+            "avgQuizScore": _r(sum(c["avgQuizScore"] * c["quizAttempts"] for c in out if c["quizAttempts"]) / total_attempts)
+            if total_attempts else None,
+        },
+        "courses": out,
+        "weakTopics": weak[:8],
+    }
