@@ -12,6 +12,7 @@ from saarthi_backend.model import (
     Course,
     Enrollment,
     Material,
+    StreamComment,
     StreamItem,
     User,
     Video,
@@ -627,3 +628,33 @@ class ClassroomInviteDAO:
             .offset(offset)
         )
         return list(result.scalars().all())
+
+
+class StreamCommentDAO:
+    @staticmethod
+    async def list_by_item(db: AsyncSession, item_id: int, limit: int = 200) -> list[StreamComment]:
+        result = await db.execute(
+            select(StreamComment)
+            .where(StreamComment.stream_item_id == item_id)
+            .order_by(StreamComment.created_at)
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def get_by_id(db: AsyncSession, comment_id: int) -> StreamComment | None:
+        result = await db.execute(select(StreamComment).where(StreamComment.id == comment_id))
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def create(db: AsyncSession, item_id: int, user_id: int, author: str, body: str) -> StreamComment:
+        c = StreamComment(stream_item_id=item_id, user_id=user_id, author=author, body=body)
+        db.add(c)
+        await db.flush()
+        await db.refresh(c)
+        return c
+
+    @staticmethod
+    async def delete(db: AsyncSession, comment: StreamComment) -> None:
+        await db.delete(comment)
+        await db.flush()

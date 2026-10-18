@@ -117,3 +117,18 @@ class ClassroomInvite(Base):
     accepted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class StreamComment(Base):
+    """Comment on a stream item (students and teachers comment; only teachers post announcements)."""
+
+    __tablename__ = "saarthi_stream_comments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    stream_item_id: Mapped[int] = mapped_column(
+        ForeignKey("saarthi_stream_items.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("saarthi_users.id", ondelete="CASCADE"), nullable=False, index=True)
+    author: Mapped[str] = mapped_column(String(255), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

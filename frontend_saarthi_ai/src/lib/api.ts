@@ -99,6 +99,8 @@ export interface AssignmentResponse {
   topic?: string;
   attachments?: string;
   createdAt: string;
+  status?: string;
+  grade?: number;
 }
 
 export interface MaterialResponse {

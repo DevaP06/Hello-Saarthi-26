@@ -167,6 +167,12 @@ async def delete_assignment(db: AsyncSession, assignment_id: int) -> bool:
     return await AssignmentDAO.delete(db, assignment_id)
 
 
+async def get_submission(
+    db: AsyncSession, user_id: int, assignment_id: int
+) -> AssignmentSubmission | None:
+    return await AssignmentSubmissionDAO.get(db, user_id, assignment_id)
+
+
 async def submit_assignment(
     db: AsyncSession,
     user_id: int,
@@ -305,10 +311,12 @@ async def create_invite(
     course_id: int,
     invited_by: int,
     email: str,
-    expires_in_hours: int = 72,
+    expires_in_hours: int | None = None,
 ) -> ClassroomInvite:
     invite_code = _generate_invite_code()
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)
+    # Open class codes (email='*') are shared with a whole class, so they live longer.
+    hours = expires_in_hours or (168 if email.strip() == "*" else 72)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=hours)
     invite = await ClassroomInviteDAO.create(
         db,
         course_id=course_id,
@@ -343,13 +351,17 @@ async def join_by_invite_code(
     if not course:
         return None
 
+    # Open class codes (email="*") stay valid for every student until they expire.
+    single_use = invite.email != "*"
     existing = await EnrollmentDAO.get(db, user_id, invite.course_id)
     if existing:
-        await ClassroomInviteDAO.mark_accepted(db, invite.id)
+        if single_use:
+            await ClassroomInviteDAO.mark_accepted(db, invite.id)
         return existing, course
 
     enrollment = await EnrollmentDAO.create(db, user_id, invite.course_id)
-    await ClassroomInviteDAO.mark_accepted(db, invite.id)
+    if single_use:
+        await ClassroomInviteDAO.mark_accepted(db, invite.id)
     return enrollment, course
 
 

@@ -5,7 +5,8 @@ import {
     Link as LinkIcon, Heading, Pencil, ExternalLink, Send, Sparkles, Users
 } from 'lucide-react';
 import { useAuthStore } from '../stores/auth.store';
-import { api, uploadFile, getUploadFullUrl, getMaterialFileUrl, type CourseResponse, type PaginatedResponse, type AssignmentResponse, type MaterialResponse, type StreamItemResponse, type CoursePersonResponse } from '../lib/api';
+import StreamComments from '../components/StreamComments';
+import { api, uploadFile, getUploadFullUrl, getMaterialFileUrl, type CourseResponse, type PaginatedResponse, type AssignmentResponse, type MaterialResponse, type StreamItemResponse, type CoursePersonResponse, type VideoResponse } from '../lib/api';
 import Pagination from '../components/Pagination';
 import FileDropzone from '../components/FileDropzone';
 import ConfirmModal from '../components/ConfirmModal';
@@ -77,7 +78,8 @@ function mapAssignment(a: AssignmentResponse): Assignment {
         description: a.description ?? '',
         dueDate: a.dueDate,
         points: a.points,
-        status: 'pending',
+        status: (a.status as Assignment['status']) || 'pending',
+        grade: a.grade,
         attachments: a.attachments ? [a.attachments] : [],
         createdAt: a.createdAt,
         topic: a.topic ?? 'No topic',
@@ -94,6 +96,30 @@ function mapMaterial(m: MaterialResponse): Material {
         createdAt: m.createdAt,
         topic: m.topic ?? 'No topic',
     };
+}
+
+function mapVideo(v: VideoResponse): VideoLecture {
+    const m = Math.floor(v.durationSeconds / 60);
+    const s = String(v.durationSeconds % 60).padStart(2, '0');
+    return {
+        id: v.id,
+        title: v.title,
+        description: v.description ?? '',
+        duration: v.durationSeconds ? `${m}:${s}` : '',
+        thumbnail: '🎬',
+        url: v.url,
+        watched: false,
+        createdAt: '',
+        topic: 'Video Lectures',  // videos have no topic column yet
+    };
+}
+
+/** "45:20" or "1:02:03" -> seconds; a bare number is minutes. */
+function parseDuration(text: string | undefined): number {
+    const parts = (text ?? '').split(':').map((p) => parseInt(p, 10));
+    if (parts.length === 0 || parts.some(Number.isNaN)) return 0;
+    if (parts.length === 1) return parts[0] * 60;
+    return parts.reduce((acc, p) => acc * 60 + p, 0);
 }
 
 function mapStreamItem(s: StreamItemResponse): StreamItem {
@@ -171,6 +197,24 @@ export default function CourseDetailPage() {
     useEffect(() => {
         if (!courseId) return;
         let cancelled = false;
+        api.get<PaginatedResponse<VideoResponse>>('/videos', { course_id: courseId, limit: 100, offset: 0 })
+            .then((r) => { if (!cancelled) setVideos((r.items || []).map(mapVideo)); })
+            .catch(() => { if (!cancelled) setVideos([]); });
+        return () => { cancelled = true; };
+    }, [courseId]);
+
+    // Topics live on the items; keep any topic that an item uses so it survives a reload.
+    useEffect(() => {
+        const used = [...assignments, ...materials].map((i) => i.topic).filter((t) => t && t !== 'No topic');
+        setTopics((prev) => {
+            const extra = used.filter((t, i) => !prev.includes(t) && used.indexOf(t) === i);
+            return extra.length ? [...prev, ...extra] : prev;
+        });
+    }, [assignments, materials]);
+
+    useEffect(() => {
+        if (!courseId) return;
+        let cancelled = false;
         api.get<PaginatedResponse<StreamItemResponse>>(`/courses/${courseId}/stream`, { limit: PAGE_SIZE, offset: streamOffset })
             .then((r) => { if (!cancelled) { setStream((r.items || []).map(mapStreamItem)); setStreamTotal(r.total ?? 0); } })
             .catch(() => { if (!cancelled) setStream([]); });
@@ -231,20 +275,35 @@ export default function CourseDetailPage() {
     const [docPdfError, setDocPdfError] = useState<string | null>(null);
     const [docPdfLoading, setDocPdfLoading] = useState(false);
 
-    const handlePostAnnouncement = () => {
-        if (!announcementText.trim()) return;
-        const now = new Date().toISOString().split('T')[0];
-        const newPost: StreamItem = {
-            id: Date.now().toString(),
-            type: 'announcement',
-            title: '',
-            description: announcementText.trim(),
-            createdAt: now,
-            author: userName
-        };
-        setStream(prev => [newPost, ...prev]);
-        setAnnouncementText('');
-        setIsComposing(false);
+    /** Save a stream entry for new classwork; best-effort so a failure never blocks the item itself. */
+    const announce = async (type: 'material' | 'assignment' | 'video', label: string, description: string) => {
+        try {
+            const post = await api.post<StreamItemResponse>(`/courses/${courseId}/stream`, {
+                type,
+                title: `${userName} posted a new ${label}:`,
+                description,
+            });
+            setStream((prev) => [mapStreamItem(post), ...prev]);
+            setStreamTotal((t) => t + 1);
+        } catch {
+            // ignore
+        }
+    };
+
+    const handlePostAnnouncement = async () => {
+        if (!announcementText.trim() || !courseId) return;
+        try {
+            const created = await api.post<StreamItemResponse>(`/courses/${courseId}/stream`, {
+                type: 'announcement',
+                description: announcementText.trim(),
+            });
+            setStream((prev) => [mapStreamItem(created), ...prev]);
+            setStreamTotal((t) => t + 1);
+            setAnnouncementText('');
+            setIsComposing(false);
+        } catch (e) {
+            toast.showToast(e instanceof Error ? e.message : 'Failed to post announcement', 'error');
+        }
     };
 
     const openModal = (type: ModalType, item?: any) => {
@@ -263,7 +322,6 @@ export default function CourseDetailPage() {
     };
 
     const handleSave = async () => {
-        const now = new Date().toISOString().split('T')[0];
         if (modalType === 'topic') {
             if (formData.title && !topics.includes(formData.title)) {
                 setTopics([...topics, formData.title]);
@@ -297,7 +355,7 @@ export default function CourseDetailPage() {
                     const created = await api.post<MaterialResponse>(`/courses/${courseId}/materials`, payload);
                     setMaterials((prev) => [mapMaterial(created), ...prev]);
                     setMaterialsTotal((t) => t + 1);
-                    setStream((prev) => [{ id: created.id, type: 'material', title: `${userName} posted a new material:`, description: formData.title, createdAt: now, author: userName }, ...prev]);
+                    void announce('material', 'material', formData.title);
                 }
                 setModalType(null);
                 setMaterialFormError(null);
@@ -308,25 +366,70 @@ export default function CourseDetailPage() {
             }
             return;
         }
-        if (modalType === 'assignment') {
-            if (editItem) {
-                setAssignments((prev) => prev.map((a) => (a.id === editItem.id ? { ...a, ...formData } : a)));
-            } else {
-                const newA: Assignment = { id: Date.now().toString(), ...formData, status: 'pending', createdAt: now };
-                setAssignments((prev) => [newA, ...prev]);
-                setStream((prev) => [{ id: Date.now().toString(), type: 'assignment', title: `${userName} posted a new assignment:`, description: formData.title, createdAt: now, author: userName }, ...prev]);
+        if (modalType === 'assignment' && courseId) {
+            if (!formData.title?.trim() || !formData.dueDate) {
+                toast.showToast('Title and due date are required', 'error');
+                return;
+            }
+            try {
+                const topic = formData.topic && formData.topic !== 'No topic' ? formData.topic : undefined;
+                const payload = {
+                    title: formData.title.trim(),
+                    description: formData.description?.trim() || undefined,
+                    dueDate: formData.dueDate,
+                    points: formData.points || 100,
+                    topic,
+                };
+                const saved = editItem
+                    ? await api.patch<AssignmentResponse>(`/courses/${courseId}/assignments/${editItem.id}`, payload)
+                    : await api.post<AssignmentResponse>(`/courses/${courseId}/assignments`, payload);
+                if (editItem) {
+                    setAssignments((prev) => prev.map((a) => (a.id === editItem.id ? mapAssignment(saved) : a)));
+                } else {
+                    setAssignments((prev) => [mapAssignment(saved), ...prev]);
+                    void announce('assignment', 'assignment', saved.title);
+                }
+            } catch (e) {
+                toast.showToast(e instanceof Error ? e.message : 'Failed to save assignment', 'error');
+                return;
             }
         }
-        else if (modalType === 'video') {
-            if (editItem) {
-                setVideos((prev) => prev.map((v) => (v.id === editItem.id ? { ...v, ...formData } : v)));
-            } else {
-                const newV: VideoLecture = { id: Date.now().toString(), ...formData, thumbnail: '🎬', watched: false, createdAt: now };
-                setVideos((prev) => [newV, ...prev]);
-                setStream((prev) => [{ id: Date.now().toString(), type: 'video', title: `${userName} posted a new video lecture:`, description: formData.title, createdAt: now, author: userName }, ...prev]);
+        else if (modalType === 'video' && courseId) {
+            if (!formData.title?.trim() || !formData.url?.trim()) {
+                toast.showToast('Title and video URL are required', 'error');
+                return;
+            }
+            try {
+                const saved = await api.post<VideoResponse>('/videos', {
+                    title: formData.title.trim(),
+                    url: formData.url.trim(),
+                    description: formData.description?.trim() || undefined,
+                    durationSeconds: parseDuration(formData.duration),
+                    courseId: Number(courseId),
+                });
+                setVideos((prev) => [mapVideo(saved), ...prev]);
+                void announce('video', 'video lecture', saved.title);
+            } catch (e) {
+                toast.showToast(e instanceof Error ? e.message : 'Failed to save video', 'error');
+                return;
             }
         }
         setModalType(null);
+    };
+
+    const handleDeleteWork = async (item: { id: string; itemType: 'assignment' | 'video'; title: string }) => {
+        if (!window.confirm(`Delete "${item.title}"?`)) return;
+        try {
+            if (item.itemType === 'assignment') {
+                await api.delete(`/courses/${courseId}/assignments/${item.id}`);
+                setAssignments((prev) => prev.filter((a) => a.id !== item.id));
+            } else {
+                await api.delete(`/videos/${item.id}`);
+                setVideos((prev) => prev.filter((v) => v.id !== item.id));
+            }
+        } catch (e) {
+            toast.showToast(e instanceof Error ? e.message : 'Delete failed', 'error');
+        }
     };
 
     useEffect(() => {
@@ -485,7 +588,7 @@ export default function CourseDetailPage() {
                         </div>
 
                         {/* Compose Post */}
-                        <div className="cd-compose-card">
+                        <div className="cd-compose-card" style={isInstructor ? undefined : { display: 'none' }}>
                             {!isComposing ? (
                                 <div className="cd-compose-trigger" onClick={() => setIsComposing(true)}>
                                     <div className="cd-avatar">{userName.charAt(0)}</div>
@@ -519,7 +622,7 @@ export default function CourseDetailPage() {
 
                         {/* Stream Feed */}
                         <div className="cd-feed">
-                            {[...stream].slice().reverse().map((item) => (
+                            {stream.map((item) => (
                                 <div key={item.id} className="cd-feed-item">
                                     <div className="cd-feed-header">
                                         <div className="cd-feed-icon">
@@ -545,7 +648,7 @@ export default function CourseDetailPage() {
                                         <p>{item.description}</p>
                                     </div>
                                     <div className="cd-feed-footer">
-                                        <button className="btn btn-ghost btn-sm">Add class comment</button>
+                                        {courseId && <StreamComments courseId={courseId} itemId={item.id} canModerate={isInstructor} />}
                                     </div>
                                 </div>
                             ))}
@@ -647,7 +750,7 @@ export default function CourseDetailPage() {
                                                             )}
                                                         </>
                                                     )}
-                                                    {item.itemType !== 'material' && isInstructor && <button className="btn-icon"><Trash2 size={16} /></button>}
+                                                    {item.itemType !== 'material' && isInstructor && <button type="button" className="btn-icon" title="Delete" onClick={() => handleDeleteWork(item)}><Trash2 size={16} /></button>}
                                                 </div>
                                             </div>
                                         ))}
@@ -675,7 +778,6 @@ export default function CourseDetailPage() {
                                 <div className="cd-avatar">{p.fullName.charAt(0).toUpperCase()}</div>
                                 <div>
                                     <span>{p.fullName}</span>
-                                    <span className="cd-person-progress">{p.progressPercent}% complete</span>
                                 </div>
                             </div>
                         ))}
