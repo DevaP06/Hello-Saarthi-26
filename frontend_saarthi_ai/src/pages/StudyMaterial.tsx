@@ -38,6 +38,8 @@ const NOTE_FILES = [
     { file: 'Digital_Signal_Processing.json', label: 'Digital Signal Processing', icon: '📡' },
     { file: 'Laplace.json', label: 'Laplace Transform', icon: '📐' },
     { file: 'Z-Transform.json', label: 'Z-Transform', icon: '🔢' },
+    { file: 'MDA.JSON', label: 'MDA', icon: '📊' },
+    { file: 'PR_NOTES.json', label: 'Pattern Recognition', icon: '🧠' },
 ];
 
 /* ── helpers ── */
@@ -297,7 +299,7 @@ export default function StudyMaterialPage() {
         setError(null);
         Promise.all(
             NOTE_FILES.map(async (nf) => {
-                const res = await fetch(`/notes/${nf.file}`);
+                const res = await fetch(`${import.meta.env.BASE_URL}notes/${nf.file}`);
                 if (!res.ok) throw new Error(`Failed to load ${nf.file}`);
                 const data: NoteDocument = await res.json();
                 return [nf.file, data] as [string, NoteDocument];

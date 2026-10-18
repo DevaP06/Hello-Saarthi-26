@@ -129,7 +129,7 @@ export const useAuthStore = create<AuthState>()(
                 try {
                     const token = get().token;
                     if (!token) throw new Error('No token');
-                    let res = await fetch(`${API_URL}/auth/profile`, { 
+                    let res = await fetch(`${API_URL}/auth/me`, { 
                         headers: { 'Authorization': `Bearer ${token}` }
                     });
                     if (!res.ok) {
