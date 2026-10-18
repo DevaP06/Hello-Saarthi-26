@@ -2,7 +2,8 @@ import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
     ArrowLeft, Plus, FileText, Video, BookOpen, Trash2, X, Save, Paperclip,
-    Link as LinkIcon, Heading, Pencil, ExternalLink, Send, Sparkles, Users
+    Link as LinkIcon, Heading, Pencil, ExternalLink, Send, Sparkles, Users,
+    Mail, LogIn, CheckCircle2, XCircle
 } from 'lucide-react';
 import { useAuthStore } from '../stores/auth.store';
 import StreamComments from '../components/StreamComments';
@@ -59,6 +60,8 @@ interface StreamItem {
     description: string;
     createdAt: string;
     author: string;
+    comments?: { id: string, text: string, author: string, createdAt: string }[];
+    attachments?: { name: string, url: string }[];
 }
 
 type DocChatMessage = { role: 'user' | 'assistant'; content: string };
@@ -123,13 +126,33 @@ function parseDuration(text: string | undefined): number {
 }
 
 function mapStreamItem(s: StreamItemResponse): StreamItem {
+    let raw = s.description || '';
+    let description = raw;
+    let comments: { id: string, text: string, author: string, createdAt: string }[] = [];
+    let attachments: { name: string, url: string }[] = [];
+
+    // Parse out attachments first
+    if (description.includes('___ATTACHMENTS___')) {
+        const parts = description.split('___ATTACHMENTS___');
+        description = parts[0];
+        try { attachments = JSON.parse(parts[1]); } catch { /* ignore */ }
+    }
+    // Then parse comments (which comes after attachments in the stored string)
+    if (description.includes('___COMMENTS___')) {
+        const parts = description.split('___COMMENTS___');
+        description = parts[0];
+        try { comments = JSON.parse(parts[1]); } catch { /* ignore */ }
+    }
+
     return {
         id: s.id,
         type: (s.type as StreamItem['type']) || 'announcement',
         title: s.title ?? '',
-        description: s.description,
+        description,
         createdAt: s.createdAt,
         author: s.author,
+        comments,
+        attachments,
     };
 }
 
@@ -147,11 +170,11 @@ export default function CourseDetailPage() {
     const [courseError, setCourseError] = useState<string | null>(null);
     const [activeTab, setActiveTab] = useState('stream');
     const [assignments, setAssignments] = useState<Assignment[]>([]);
-    const [, setAssignmentsTotal] = useState(0);
-    const [assignmentsOffset] = useState(0);
+    const [assignmentsTotal, setAssignmentsTotal] = useState(0);
+    const [assignmentsOffset, setAssignmentsOffset] = useState(0);
     const [materials, setMaterials] = useState<Material[]>([]);
-    const [, setMaterialsTotal] = useState(0);
-    const [materialsOffset] = useState(0);
+    const [materialsTotal, setMaterialsTotal] = useState(0);
+    const [materialsOffset, setMaterialsOffset] = useState(0);
     const [stream, setStream] = useState<StreamItem[]>([]);
     const [streamTotal, setStreamTotal] = useState(0);
     const [streamOffset, setStreamOffset] = useState(0);
@@ -269,6 +292,7 @@ export default function CourseDetailPage() {
     const [materialToDelete, setMaterialToDelete] = useState<Material | null>(null);
     const [materialFormError, setMaterialFormError] = useState<string | null>(null);
     const [docChatMessages, setDocChatMessages] = useState<DocChatMessage[]>([]);
+    const [docChatFollowups, setDocChatFollowups] = useState<string[]>([]);
     const [docChatInput, setDocChatInput] = useState('');
     const [docChatSending, setDocChatSending] = useState(false);
     const [docPdfObjectUrl, setDocPdfObjectUrl] = useState<string | null>(null);
@@ -290,19 +314,70 @@ export default function CourseDetailPage() {
         }
     };
 
+    // Invite state (teacher)
+    const [showInviteModal, setShowInviteModal] = useState(false);
+    const [inviteEmail, setInviteEmail] = useState('');
+    const [inviteSending, setInviteSending] = useState(false);
+    const [invitedEmails, setInvitedEmails] = useState<string[]>([]);
+    const [inviteError, setInviteError] = useState('');
+    const [csvResults, setCsvResults] = useState<{ email: string; sent: boolean; error?: string }[]>([]);
+    const [csvLoading, setCsvLoading] = useState(false);
+
+    // Join state (student)
+    const [showJoinModal, setShowJoinModal] = useState(false);
+    const [joinCode, setJoinCode] = useState('');
+    const [joinLoading, setJoinLoading] = useState(false);
+    const [joinError, setJoinError] = useState('');
+    const [joinSuccess, setJoinSuccess] = useState('');
+
+    const [showSuccessModal, setShowSuccessModal] = useState(false);
+    const [isPostingAnnouncement, setIsPostingAnnouncement] = useState(false);
+    const [announcementAttachments, setAnnouncementAttachments] = useState<File[]>([]);
+    const [openInviteCode, setOpenInviteCode] = useState<string | null>(null);
+    const [generatingOpenCode, setGeneratingOpenCode] = useState(false);
+    const [inviteResult, setInviteResult] = useState<string | null>(null);
+
     const handlePostAnnouncement = async () => {
-        if (!announcementText.trim() || !courseId) return;
+        if (!announcementText.trim() || isPostingAnnouncement) return;
+        setIsPostingAnnouncement(true);
         try {
-            const created = await api.post<StreamItemResponse>(`/courses/${courseId}/stream`, {
+            // Upload any attached files first
+            let uploadedAttachments: { name: string, url: string }[] = [];
+            if (announcementAttachments.length > 0) {
+                const uploads = await Promise.allSettled(
+                    announcementAttachments.map(async (file) => {
+                        const { url } = await uploadFile(file);
+                        return { name: file.name, url: getUploadFullUrl(url) };
+                    })
+                );
+                uploadedAttachments = uploads
+                    .filter((r): r is PromiseFulfilledResult<{ name: string, url: string }> => r.status === 'fulfilled')
+                    .map(r => r.value);
+            }
+
+            // Build description with attachments embedded
+            let description = announcementText.trim();
+            if (uploadedAttachments.length > 0) {
+                description += '___ATTACHMENTS___' + JSON.stringify(uploadedAttachments);
+            }
+
+            const payload = {
                 type: 'announcement',
-                description: announcementText.trim(),
-            });
-            setStream((prev) => [mapStreamItem(created), ...prev]);
-            setStreamTotal((t) => t + 1);
+                description,
+            };
+            const created = await api.post<StreamItemResponse>(`/courses/${courseId}/stream`, payload);
+            setStream(prev => [mapStreamItem(created), ...prev]);
+            setStreamTotal(t => t + 1);
             setAnnouncementText('');
+            setAnnouncementAttachments([]);
             setIsComposing(false);
-        } catch (e) {
-            toast.showToast(e instanceof Error ? e.message : 'Failed to post announcement', 'error');
+            setShowSuccessModal(true);
+            setTimeout(() => setShowSuccessModal(false), 3000);
+        } catch (e: any) {
+            console.error('Failed to post announcement:', e.response?.data || e.message || e);
+            toast.showToast('Failed to post announcement', 'error');
+        } finally {
+            setIsPostingAnnouncement(false);
         }
     };
 
@@ -458,7 +533,15 @@ export default function CourseDetailPage() {
             if (prev) URL.revokeObjectURL(prev);
             return null;
         });
-        fetch(url, { credentials: 'include' })
+        const storedToken = (() => { try { return JSON.parse(localStorage.getItem('saarthi-auth') || '{}')?.state?.token ?? null; } catch { return null; } })();
+        const base = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
+        fetch(url, {
+            credentials: 'include',
+            headers: {
+                ...(storedToken ? { 'Authorization': `Bearer ${storedToken}` } : {}),
+                ...(base.includes('ngrok') ? { 'ngrok-skip-browser-warning': '1' } : {}),
+            },
+        })
             .then((res) => {
                 if (!res.ok) throw new Error(res.status === 401 || res.status === 403 ? 'Please sign in again to view this file.' : `Could not load file (${res.status}).`);
                 return res.blob();
@@ -483,6 +566,7 @@ export default function CourseDetailPage() {
         if (!viewingMaterial || !docChatInput.trim() || docChatSending) return;
         const userContent = docChatInput.trim();
         setDocChatInput('');
+        setDocChatFollowups([]);
         setDocChatMessages((prev) => [...prev, { role: 'user', content: userContent }]);
         setDocChatSending(true);
         try {
@@ -490,8 +574,14 @@ export default function CourseDetailPage() {
                 message: userContent,
                 conversationHistory: docChatMessages,
                 contextMaterialTitle: viewingMaterial.title,
+                courseId: courseId ? parseInt(courseId) : undefined,
             });
-            setDocChatMessages((prev: DocChatMessage[]) => [...prev, { role: 'assistant', content: data.response }]);
+            const raw = data.response || '';
+            const followupMatch = raw.match(/FOLLOWUPS?:\s*(.+)$/im);
+            const followups = followupMatch ? followupMatch[1].split('|').map((s: string) => s.trim()).filter(Boolean) : [];
+            const clean = raw.replace(/CHECKPOINT\s*/gi, '').replace(/FOLLOWUPS?:.*$/im, '').trim();
+            setDocChatFollowups(followups);
+            setDocChatMessages((prev: DocChatMessage[]) => [...prev, { role: 'assistant', content: clean }]);
         } catch (e) {
             setDocChatMessages((prev: DocChatMessage[]) => [...prev, { role: 'assistant', content: (e instanceof Error ? e.message : 'Something went wrong. Please try again.') }]);
         } finally {
@@ -518,6 +608,73 @@ export default function CourseDetailPage() {
         }
     };
 
+
+    const handleSendInvite = async () => {
+        if (!inviteEmail.trim() || !courseId) return;
+        setInviteSending(true);
+        setInviteError('');
+        try {
+            await api.post(`/courses/${courseId}/invite`, { email: inviteEmail.trim() });
+            setInvitedEmails((prev) => [...prev, inviteEmail.trim()]);
+            setInviteEmail('');
+        } catch (e) {
+            setInviteError(e instanceof Error ? e.message : 'Failed to send invite.');
+        } finally {
+            setInviteSending(false);
+        }
+    };
+
+    const handleCsvUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file || !courseId) return;
+        e.target.value = '';
+        const text = await file.text();
+        const emails = Array.from(
+            new Set(
+                text.split(/[\r\n,;\t]+/)
+                    .map((s) => s.replace(/^["'\s]+|["'\s]+$/g, '').toLowerCase())
+                    .filter((s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s))
+            )
+        );
+        if (emails.length === 0) {
+            setInviteError('No valid email addresses found in the CSV.');
+            return;
+        }
+        setInviteError('');
+        setCsvLoading(true);
+        setCsvResults([]);
+        const results: { email: string; sent: boolean; error?: string }[] = [];
+        for (const email of emails) {
+            try {
+                await api.post(`/courses/${courseId}/invite`, { email });
+                results.push({ email, sent: true });
+            } catch (err) {
+                results.push({ email, sent: false, error: err instanceof Error ? err.message : 'Failed' });
+            }
+            setCsvResults([...results]);
+        }
+        setCsvLoading(false);
+    };
+
+    const handleJoinCourse = async () => {
+        if (!joinCode.trim()) return;
+        setJoinLoading(true);
+        setJoinError('');
+        setJoinSuccess('');
+        try {
+            const res = await api.post<{ courseTitle: string; message: string }>('/courses/join', { inviteCode: joinCode.trim() });
+            setJoinSuccess(res.message || `You joined ${res.courseTitle}!`);
+            setJoinCode('');
+            // Reload people list
+            const r = await api.get<{ items: CoursePersonResponse[]; total: number }>(`/courses/${courseId}/people`, { limit: PAGE_SIZE, offset: 0 });
+            setPeople(r.items || []);
+            setPeopleTotal(r.total ?? 0);
+        } catch (e) {
+            setJoinError(e instanceof Error ? e.message : 'Invalid or expired invite code.');
+        } finally {
+            setJoinLoading(false);
+        }
+    };
 
     // Calculate Items by Topic
     const itemsByTopic: Record<string, any[]> = {};
@@ -604,16 +761,42 @@ export default function CourseDetailPage() {
                                             autoFocus
                                         />
                                     </div>
+                                    {/* Attachment preview */}
+                                    {announcementAttachments.length > 0 && (
+                                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', padding: '0.5rem 1rem', borderTop: '1px solid var(--border)' }}>
+                                            {announcementAttachments.map((f, i) => (
+                                                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', background: 'var(--surface-hover)', borderRadius: '0.4rem', padding: '0.25rem 0.6rem', fontSize: '0.8rem' }}>
+                                                    <Paperclip size={12} />
+                                                    <span style={{ maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                                                    <button type="button" style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 0, lineHeight: 1 }} onClick={() => setAnnouncementAttachments(prev => prev.filter((_, j) => j !== i))}><X size={12} /></button>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
                                     <div className="cd-editor-tools">
                                         <div className="cd-editor-icons">
-                                            <button className="btn-icon"><Heading size={16} /></button>
-                                            <button className="btn-icon"><LinkIcon size={16} /></button>
-                                            <button className="btn-icon"><Video size={16} /></button>
-                                            <button className="btn-icon"><Paperclip size={16} /></button>
+                                            <button className="btn-icon" title="Bold text" onClick={() => setAnnouncementText(t => t + ' **bold text**')}>B</button>
+                                            <button className="btn-icon" title="Insert link" onClick={() => {
+                                                const url = window.prompt('Enter URL:');
+                                                if (url) setAnnouncementText(t => t + ` [link](${url})`);
+                                            }}><LinkIcon size={15} /></button>
+                                            <button className="btn-icon" title="Attach files" onClick={() => {
+                                                const inp = document.createElement('input');
+                                                inp.type = 'file';
+                                                inp.multiple = true;
+                                                inp.accept = '.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.png,.jpg,.jpeg,.zip';
+                                                inp.onchange = () => {
+                                                    const files = Array.from(inp.files || []);
+                                                    if (files.length) setAnnouncementAttachments(prev => [...prev, ...files]);
+                                                };
+                                                inp.click();
+                                            }}><Paperclip size={15} /></button>
                                         </div>
                                         <div className="cd-editor-actions">
-                                            <button className="btn btn-ghost" onClick={() => setIsComposing(false)}>Cancel</button>
-                                            <button className="btn btn-primary" onClick={handlePostAnnouncement} disabled={!announcementText.trim()}>Post</button>
+                                            <button className="btn btn-ghost" onClick={() => { setIsComposing(false); setAnnouncementAttachments([]); setAnnouncementText(''); }}>Cancel</button>
+                                            <button className="btn btn-primary" onClick={handlePostAnnouncement} disabled={!announcementText.trim() || isPostingAnnouncement}>
+                                                {isPostingAnnouncement ? <><span className="loading loading-spinner loading-sm"></span> Uploading…</> : 'Post'}
+                                            </button>
                                         </div>
                                     </div>
                                 </div>
@@ -646,6 +829,29 @@ export default function CourseDetailPage() {
                                     <div className="cd-feed-body">
                                         {item.type === 'announcement' && item.title && <h4>{item.title}</h4>}
                                         <p>{item.description}</p>
+                                        {/* Render attachments */}
+                                        {item.attachments && item.attachments.length > 0 && (
+                                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.75rem' }}>
+                                                {item.attachments.map((att, i) => (
+                                                    <a
+                                                        key={i}
+                                                        href={att.url}
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        style={{
+                                                            display: 'flex', alignItems: 'center', gap: '0.4rem',
+                                                            background: 'var(--surface-hover)', border: '1px solid var(--border)',
+                                                            borderRadius: '0.5rem', padding: '0.35rem 0.75rem',
+                                                            fontSize: '0.82rem', color: 'var(--primary)', textDecoration: 'none',
+                                                            transition: 'background 0.15s'
+                                                        }}
+                                                    >
+                                                        <Paperclip size={13} />
+                                                        <span style={{ maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{att.name}</span>
+                                                    </a>
+                                                ))}
+                                            </div>
+                                        )}
                                     </div>
                                     <div className="cd-feed-footer">
                                         {courseId && <StreamComments courseId={courseId} itemId={item.id} canModerate={isInstructor} />}
@@ -769,7 +975,18 @@ export default function CourseDetailPage() {
             {activeTab === 'people' && (
                 <div className="cd-people-container">
                     <div className="cd-people-section">
-                        <h2>Classmates ({peopleTotal})</h2>
+                        <div className="cd-people-header">
+                            <h2>Classmates ({peopleTotal})</h2>
+                            {isInstructor ? (
+                                <button className="btn btn-primary btn-sm" onClick={() => { setShowInviteModal(true); setInviteResult(null); setInviteError(''); }}>
+                                    <Mail size={15} /> Invite Students
+                                </button>
+                            ) : (
+                                <button className="btn btn-outline btn-sm" onClick={() => { setShowJoinModal(true); setJoinError(''); setJoinSuccess(''); }}>
+                                    <LogIn size={15} /> Join with Code
+                                </button>
+                            )}
+                        </div>
                         {people.length === 0 && peopleTotal === 0 && (
                             <EmptyState icon={<Users size={28} />} title="No one enrolled yet" description="Enrolled classmates will appear here." />
                         )}
@@ -952,9 +1169,28 @@ export default function CourseDetailPage() {
                                         {docChatMessages.map((msg, i) => (
                                             <div key={i} className={`cd-doc-view-msg cd-doc-view-msg-${msg.role}`}>
                                                 <span className="cd-doc-view-msg-role">{msg.role === 'user' ? 'You' : 'Saarthi'}</span>
-                                                <div className="cd-doc-view-msg-content">{msg.content}</div>
+                                                <div
+                                                    className="cd-doc-view-msg-content"
+                                                    dangerouslySetInnerHTML={{
+                                                        __html: msg.content
+                                                            .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+                                                            .replace(/\*(.+?)\*/g, '<em>$1</em>')
+                                                            .replace(/`(.+?)`/g, '<code>$1</code>')
+                                                            .replace(/^#{1,3} (.+)$/gm, '<strong>$1</strong>')
+                                                            .replace(/\n/g, '<br/>')
+                                                    }}
+                                                />
                                             </div>
                                         ))}
+                                        {docChatFollowups.length > 0 && !docChatSending && (
+                                            <div className="cd-doc-followups">
+                                                {docChatFollowups.map((q, i) => (
+                                                    <button key={i} className="cd-doc-followup-chip" onClick={() => { setDocChatInput(q); setDocChatFollowups([]); }}>
+                                                        {q}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        )}
                                         {docChatSending && (
                                             <div className="cd-doc-view-msg cd-doc-view-msg-assistant">
                                                 <span className="cd-doc-view-msg-role">Saarthi</span>
@@ -1001,6 +1237,168 @@ export default function CourseDetailPage() {
                 loading={!!deletingMaterialId}
             />
 
+            {/* ── Invite Students Modal (teacher) ── */}
+            {showInviteModal && (
+                <div className="cd-modal-overlay" onClick={() => { setShowInviteModal(false); setCsvResults([]); setInvitedEmails([]); setOpenInviteCode(null); }}>
+                    <div className="cd-modal cd-modal-wide animate-scale-in" onClick={(e) => e.stopPropagation()}>
+                        <div className="cd-modal-header">
+                            <h2><Mail size={18} /> Invite Students</h2>
+                            <button className="cd-modal-close" onClick={() => { setShowInviteModal(false); setCsvResults([]); setInvitedEmails([]); }}><X size={20} /></button>
+                        </div>
+                        <div className="cd-modal-body">
+
+                            {/* Open Invite Code section */}
+                            <div className="cd-invite-section" style={{ background: 'var(--surface-hover)', borderRadius: '0.75rem', padding: '1rem', marginBottom: '0.25rem' }}>
+                                <p className="cd-invite-section-label">🔗 Open Invite Code</p>
+                                <p style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', marginBottom: '0.75rem' }}>
+                                    Generate a universal code. Anyone with it can join — share it on a board or group chat.
+                                </p>
+                                {openInviteCode ? (
+                                    <div>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', background: 'var(--bg)', border: '2px dashed var(--primary)', borderRadius: '0.5rem', padding: '0.75rem 1rem', marginBottom: '0.5rem' }}>
+                                            <code style={{ flex: 1, fontSize: '1.1rem', fontFamily: 'monospace', letterSpacing: '0.1em', color: 'var(--primary)', fontWeight: 700 }}>{openInviteCode}</code>
+                                            <button className="btn btn-sm btn-outline" onClick={() => { navigator.clipboard.writeText(openInviteCode); toast.showToast('Invite code copied!'); }}>Copy</button>
+                                        </div>
+                                        <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>⏳ Code valid for 7 days. Share this code with students.</p>
+                                    </div>
+                                ) : (
+                                    <button
+                                        className="btn btn-outline btn-sm"
+                                        disabled={generatingOpenCode}
+                                        onClick={async () => {
+                                            setGeneratingOpenCode(true);
+                                            try {
+                                                const res = await api.post<{ inviteCode: string }>(`/courses/${courseId}/invite`, { email: '*' });
+                                                setOpenInviteCode(res.inviteCode);
+                                            } catch (e) {
+                                                setInviteError(e instanceof Error ? e.message : 'Failed to generate code.');
+                                            } finally {
+                                                setGeneratingOpenCode(false);
+                                            }
+                                        }}
+                                    >
+                                        {generatingOpenCode ? <span className="loading loading-spinner loading-sm"></span> : '✨ Generate Open Code'}
+                                    </button>
+                                )}
+                            </div>
+
+                            <div className="cd-invite-divider"><span>or invite a specific student by email</span></div>
+
+                            {/* Single invite */}
+                            <div className="cd-invite-section">
+                                <p className="cd-invite-section-label">Invite by email</p>
+                                <p style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', marginBottom: '0.75rem' }}>
+                                    The student will receive an email with a link. One click and they're enrolled — no code needed.
+                                </p>
+                                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                                    <input
+                                        className="input"
+                                        placeholder="student@example.com"
+                                        value={inviteEmail}
+                                        onChange={(e) => setInviteEmail(e.target.value)}
+                                        onKeyDown={(e) => e.key === 'Enter' && handleSendInvite()}
+                                    />
+                                    <button className="btn btn-primary" onClick={handleSendInvite} disabled={inviteSending || !inviteEmail.trim()}>
+                                        {inviteSending ? 'Sending…' : 'Send Invite'}
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Sent confirmations */}
+                            {invitedEmails.length > 0 && (
+                                <div className="cd-invited-list">
+                                    {invitedEmails.map((em, i) => (
+                                        <div key={i} className="cd-invited-row">
+                                            <CheckCircle2 size={15} style={{ color: '#5FA89C', flexShrink: 0 }} />
+                                            <span>{em}</span>
+                                            <span className="cd-invited-tag">Invite sent</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+
+                            {/* Divider */}
+                            <div className="cd-invite-divider"><span>or bulk invite</span></div>
+
+                            {/* CSV bulk invite */}
+                            <div className="cd-invite-section">
+                                <p className="cd-invite-section-label">Bulk invite via CSV</p>
+                                <p style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', marginBottom: '0.75rem' }}>
+                                    Upload a CSV — all email addresses are detected automatically and each gets an invite email.
+                                </p>
+                                <label className="cd-csv-upload-btn">
+                                    <input type="file" accept=".csv,.txt" onChange={handleCsvUpload} style={{ display: 'none' }} />
+                                    <Mail size={15} /> {csvLoading ? `Sending invites… (${csvResults.length} done)` : 'Upload CSV'}
+                                </label>
+                            </div>
+
+                            {inviteError && <p style={{ color: 'var(--error)', fontSize: '0.8125rem', marginTop: '0.5rem' }}>{inviteError}</p>}
+
+                            {/* CSV results */}
+                            {csvResults.length > 0 && (
+                                <div className="cd-csv-results">
+                                    <div className="cd-csv-results-header">
+                                        <span>{csvResults.filter(r => r.sent).length} of {csvResults.length} invites sent</span>
+                                    </div>
+                                    <div className="cd-csv-table">
+                                        {csvResults.map((r, i) => (
+                                            <div key={i} className={`cd-csv-row ${r.error ? 'cd-csv-row-error' : ''}`}>
+                                                {r.sent
+                                                    ? <CheckCircle2 size={14} style={{ color: '#5FA89C', flexShrink: 0 }} />
+                                                    : <XCircle size={14} style={{ color: '#C86F7A', flexShrink: 0 }} />
+                                                }
+                                                <span className="cd-csv-email">{r.email}</span>
+                                                {r.error && <span className="cd-csv-err">{r.error}</span>}
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                        <div className="cd-modal-footer">
+                            <button className="btn btn-outline" onClick={() => { setShowInviteModal(false); setCsvResults([]); setInvitedEmails([]); }}>Done</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* ── Join with Code Modal (student) ── */}
+            {showJoinModal && (
+                <div className="cd-modal-overlay" onClick={() => setShowJoinModal(false)}>
+                    <div className="cd-modal animate-scale-in" onClick={(e) => e.stopPropagation()}>
+                        <div className="cd-modal-header">
+                            <h2><LogIn size={18} /> Join with Code</h2>
+                            <button className="cd-modal-close" onClick={() => setShowJoinModal(false)}><X size={20} /></button>
+                        </div>
+                        <div className="cd-modal-body">
+                            <p style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', marginBottom: '1rem' }}>
+                                Enter the invite code your teacher shared with you.
+                            </p>
+                            <div className="cd-modal-field">
+                                <label>Invite Code</label>
+                                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                                    <input
+                                        className="input"
+                                        placeholder="e.g. aB3xYz9Qr1"
+                                        value={joinCode}
+                                        onChange={(e) => setJoinCode(e.target.value)}
+                                        onKeyDown={(e) => e.key === 'Enter' && handleJoinCourse()}
+                                    />
+                                    <button className="btn btn-primary" onClick={handleJoinCourse} disabled={joinLoading || !joinCode.trim()}>
+                                        {joinLoading ? 'Joining…' : 'Join'}
+                                    </button>
+                                </div>
+                            </div>
+                            {joinError && <p style={{ color: 'var(--error)', fontSize: '0.8125rem' }}>{joinError}</p>}
+                            {joinSuccess && <p style={{ color: 'var(--accent)', fontSize: '0.8125rem', fontWeight: 600 }}>{joinSuccess}</p>}
+                        </div>
+                        <div className="cd-modal-footer">
+                            <button className="btn btn-outline" onClick={() => setShowJoinModal(false)}>Close</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Submit Assignment Modal (file upload) */}
             {submitAssignmentId && (
                 <div className="cd-modal-overlay" onClick={() => { if (!submitting) { setSubmitAssignmentId(null); setSubmitFile(null); } }}>
@@ -1026,6 +1424,23 @@ export default function CourseDetailPage() {
                             <button className="btn btn-primary" onClick={handleSubmitAssignment} disabled={submitting}>
                                 {submitting ? 'Submitting…' : 'Submit'}
                             </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+            {showSuccessModal && (
+                <div className="cd-modal-overlay" onClick={() => setShowSuccessModal(false)}>
+                    <div className="cd-modal animate-scale-in" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '400px', textAlign: 'center' }}>
+                        <div className="cd-modal-header" style={{ borderBottom: 'none', justifyContent: 'flex-end', paddingBottom: 0 }}>
+                            <button className="cd-modal-close" onClick={() => setShowSuccessModal(false)}><X size={20} /></button>
+                        </div>
+                        <div className="cd-modal-body" style={{ padding: '0 2rem 2rem' }}>
+                            <div style={{ fontSize: '4rem', marginBottom: '1rem' }}>✅</div>
+                            <h3 style={{ fontSize: '1.5rem', fontWeight: 'bold', marginBottom: '0.5rem', color: 'var(--text-primary)' }}>Success!</h3>
+                            <p style={{ color: 'var(--text-secondary)' }}>Announcement posted successfully.</p>
+                            <div style={{ marginTop: '2rem', display: 'flex', justifyContent: 'center' }}>
+                                <button className="btn btn-primary" style={{ padding: '0.75rem 2.5rem', borderRadius: '0.75rem' }} onClick={() => setShowSuccessModal(false)}>Great</button>
+                            </div>
                         </div>
                     </div>
                 </div>

@@ -1,13 +1,13 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
+import { usePageTitle } from '../lib/usePageTitle';
 import {
     Search, Filter, Grid3X3, List, BookOpen,
-    ChevronDown, Plus, Edit3, Trash2, X, Save, UserPlus, KeyRound
+    ChevronDown, Plus, Edit3, Trash2, X, Save, LogIn
 } from 'lucide-react';
 import { useAuthStore } from '../stores/auth.store';
 import { api, type CourseResponse, type PaginatedResponse, type EnrollmentWithCourseResponse } from '../lib/api';
 import Pagination from '../components/Pagination';
-import InviteModal from '../components/InviteModal';
 import { useToast } from '../components/Toast';
 import './Courses.css';
 
@@ -50,6 +50,7 @@ const difficulties = ['All', 'Beginner', 'Intermediate', 'Advanced'];
 const PAGE_SIZE = 20;
 
 export default function CoursesPage() {
+    usePageTitle('Courses');
     const { user } = useAuthStore();
     const isAdmin = user?.role === 'admin';
     const isInstructor = isAdmin || user?.role === 'teacher';
@@ -68,10 +69,6 @@ export default function CoursesPage() {
     const navigate = useNavigate();
     const toast = useToast();
     const [searchParams, setSearchParams] = useSearchParams();
-    const [joinCode, setJoinCode] = useState(searchParams.get('code') ?? '');
-    const [joining, setJoining] = useState(false);
-    const [reloadKey, setReloadKey] = useState(0);
-    const [inviteFor, setInviteFor] = useState<CourseItem | null>(null);
 
     useEffect(() => {
         let cancelled = false;
@@ -94,36 +91,46 @@ export default function CoursesPage() {
             }
         })();
         return () => { cancelled = true; };
-    }, [offset, reloadKey]);
-
-    const handleJoin = async (code: string) => {
-        if (!code.trim()) return;
-        setJoining(true);
-        try {
-            const res = await api.post<{ courseId: string; message: string }>('/courses/join', { inviteCode: code.trim() });
-            toast.showToast(res.message);
-            setJoinCode('');
-            setReloadKey((k) => k + 1);
-        } catch (e) {
-            toast.showToast(e instanceof Error ? e.message : 'Could not join course', 'error');
-        } finally {
-            setJoining(false);
-        }
-    };
-
-    // Invite links land here as /courses?code=XXXX — join automatically once.
-    useEffect(() => {
-        const code = searchParams.get('code');
-        if (!code || isInstructor) return;
-        setSearchParams({}, { replace: true });
-        void handleJoin(code);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
+    }, [offset]);
 
     // Modal state
     const [showModal, setShowModal] = useState(false);
     const [editingCourse, setEditingCourse] = useState<CourseItem | null>(null);
     const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+
+    // Join with code (student)
+    const [showJoinModal, setShowJoinModal] = useState(false);
+    const [joinCode, setJoinCode] = useState('');
+    const [joinLoading, setJoinLoading] = useState(false);
+    const [joinError, setJoinError] = useState('');
+    const [joinSuccess, setJoinSuccess] = useState('');
+
+    // Invite links land here as /courses?code=XXXX: open the join dialog with the code filled in.
+    useEffect(() => {
+        const code = searchParams.get('code');
+        if (!code || isInstructor) return;
+        setJoinCode(code);
+        setShowJoinModal(true);
+        setSearchParams({}, { replace: true });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    const handleJoinCourse = async () => {
+        if (!joinCode.trim()) return;
+        setJoinLoading(true);
+        setJoinError('');
+        setJoinSuccess('');
+        try {
+            const res = await api.post<{ courseId: string; courseTitle: string; message: string }>('/courses/join', { inviteCode: joinCode.trim() });
+            setJoinSuccess(`You joined "${res.courseTitle}"! Refreshing...`);
+            setJoinCode('');
+            setTimeout(() => { setShowJoinModal(false); setJoinSuccess(''); window.location.reload(); }, 1800);
+        } catch (e) {
+            setJoinError(e instanceof Error ? e.message : 'Invalid or expired invite code.');
+        } finally {
+            setJoinLoading(false);
+        }
+    };
 
     // Form state
     const [formData, setFormData] = useState<Partial<CourseItem>>({});
@@ -224,21 +231,18 @@ export default function CoursesPage() {
                     <h1>Courses</h1>
                     <p>{isInstructor ? 'Manage and create courses' : 'Your courses — join a new one with a class code'}</p>
                 </div>
-                {isInstructor ? (
-                    <button className="btn btn-primary" onClick={openCreate}>
-                        <Plus size={18} /> Create Course
-                    </button>
-                ) : (
-                    <form
-                        style={{ display: 'flex', gap: '0.5rem' }}
-                        onSubmit={(e) => { e.preventDefault(); void handleJoin(joinCode); }}
-                    >
-                        <input className="input" placeholder="Class code" aria-label="Class code" value={joinCode} onChange={(e) => setJoinCode(e.target.value)} />
-                        <button className="btn btn-primary" type="submit" disabled={joining || !joinCode.trim()}>
-                            <KeyRound size={16} /> Join
+                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    {!isInstructor && (
+                        <button className="btn btn-outline" onClick={() => { setShowJoinModal(true); setJoinError(''); setJoinSuccess(''); }}>
+                            <LogIn size={18} /> Join with Code
                         </button>
-                    </form>
-                )}
+                    )}
+                    {isInstructor && (
+                        <button className="btn btn-primary" onClick={openCreate}>
+                            <Plus size={18} /> Create Course
+                        </button>
+                    )}
+                </div>
             </div>
 
             {/* Toolbar */}
@@ -314,7 +318,6 @@ export default function CoursesPage() {
                             <div className="course-card-footer">
                                 {isInstructor ? (
                                     <div className="course-card-admin-actions">
-                                        <button className="btn btn-outline btn-sm" onClick={(ev) => { ev.stopPropagation(); setInviteFor(course); }}><UserPlus size={14} /> Invite</button>
                                         <button className="btn btn-outline btn-sm" onClick={(ev) => { ev.stopPropagation(); openEdit(course); }}><Edit3 size={14} /> Edit</button>
                                         {deleteConfirm === course.id ? (
                                             <div className="course-card-delete-confirm">
@@ -351,8 +354,6 @@ export default function CoursesPage() {
             {!loading && total > 0 && (
                 <Pagination total={total} limit={PAGE_SIZE} offset={offset} onPageChange={setOffset} />
             )}
-
-            {inviteFor && <InviteModal courseId={inviteFor.id} courseTitle={inviteFor.title} onClose={() => setInviteFor(null)} />}
 
             {/* Create / Edit Modal */}
             {showModal && (
@@ -415,6 +416,43 @@ export default function CoursesPage() {
                             <button className="btn btn-primary" onClick={handleSave}>
                                 <Save size={16} /> {editingCourse ? 'Update Course' : 'Create Course'}
                             </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+            {/* Join with Code Modal (student) */}
+            {showJoinModal && (
+                <div className="course-modal-overlay" onClick={() => setShowJoinModal(false)}>
+                    <div className="course-modal animate-scale-in" onClick={e => e.stopPropagation()} style={{ maxWidth: '420px' }}>
+                        <div className="course-modal-header">
+                            <h2><LogIn size={18} /> Join with Invite Code</h2>
+                            <button className="course-modal-close" onClick={() => setShowJoinModal(false)}><X size={20} /></button>
+                        </div>
+                        <div className="course-modal-body">
+                            <p style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', marginBottom: '1rem' }}>
+                                Enter the invite code your teacher shared with you.
+                            </p>
+                            <div className="course-modal-field">
+                                <label>Invite Code</label>
+                                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                                    <input
+                                        className="input"
+                                        placeholder="e.g. aB3xYz9Qr1"
+                                        value={joinCode}
+                                        onChange={e => setJoinCode(e.target.value)}
+                                        onKeyDown={e => e.key === 'Enter' && handleJoinCourse()}
+                                        autoFocus
+                                    />
+                                    <button className="btn btn-primary" onClick={handleJoinCourse} disabled={joinLoading || !joinCode.trim()}>
+                                        {joinLoading ? <span className="loading loading-spinner loading-sm"></span> : 'Join'}
+                                    </button>
+                                </div>
+                            </div>
+                            {joinError && <p style={{ color: 'var(--error)', fontSize: '0.8125rem', marginTop: '0.5rem' }}>{joinError}</p>}
+                            {joinSuccess && <p style={{ color: 'var(--accent)', fontSize: '0.875rem', fontWeight: 600, marginTop: '0.5rem' }}>{joinSuccess}</p>}
+                        </div>
+                        <div className="course-modal-footer">
+                            <button className="btn btn-outline" onClick={() => setShowJoinModal(false)}>Cancel</button>
                         </div>
                     </div>
                 </div>
