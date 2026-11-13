@@ -1739,6 +1739,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    from scripts.env_loader import load_env_file
+
+    load_env_file()  # .env.kb, if present — makes SAARTHI_HANDWRITING_OCR etc. persistent (Part 3)
+
     args = build_arg_parser().parse_args(argv)
     args.output.mkdir(parents=True, exist_ok=True)
 
@@ -1758,7 +1762,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     succeeded = 0
     failed = 0
-    for source_path in note_files:
+    from tqdm import tqdm
+
+    for source_path in tqdm(note_files, desc="OCR notes", unit="file"):
         if not source_path.exists():
             logger.error(f"File not found: {source_path}")
             failed += 1
