@@ -90,3 +90,11 @@
 
 faster-whisper>=1.0.0
 pytesseract>=0.3.10
+tqdm>=4.66.0
+
+# PyAV >=19 removed/changed the `metadata_errors` kwarg faster-whisper's own
+# audio.py passes to av.open() — confirmed: pip installing faster-whisper
+# unpinned pulls av 19.0.2 and every video transcription then fails with
+# "open() got an unexpected keyword argument 'metadata_errors'". Pin below
+# the breaking change until faster-whisper's own av pin catches up.
+av<19
