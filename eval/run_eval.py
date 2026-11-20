@@ -214,6 +214,12 @@ def eval_ablation(items: list[dict]) -> dict:
 
 
 def main() -> int:
+    # Gold queries contain math symbols (ω, ∫); a cp1252 console or a redirect must not crash the run.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--gold", default=str(ROOT / "eval" / "gold.jsonl"))
     ap.add_argument("--with-router", action="store_true", help="also score routing (LLM calls)")

@@ -163,7 +163,19 @@ def _run_expert(expert_name, query, mode, messages, boost_terms):
             + [HumanMessage(content=final_prompt)]
         )
         expert_response = structured_llm.invoke(final_messages)
-        return expert_response, react_trace, []
+        # Grounding rule: the student-facing answer is rewritten from retrieved chunks, so hand
+        # them back (planning used to return none, which made every planned answer "not covered").
+        from dataclasses import asdict
+        from src.orchestrator.policy import top_n
+        from src.utils.llm import _TIER
+        _T = {"notes_agent": "notes", "books_agent": "books", "video_agent": "video"}
+        k = top_n(_TIER.get() or 1)
+        try:
+            planned = retrieve(query, content_types=[_T.get(expert_name, "notes")], boost_terms=boost_terms, k=k)[:k]
+        except Exception as e:
+            logger.warning("planning-mode chunk retrieval failed: %s", e)
+            planned = []
+        return expert_response, react_trace, [asdict(c) for c in planned]
 
     elif mode == "rag":
         _TYPE = {"notes_agent": "notes", "books_agent": "books", "video_agent": "video"}

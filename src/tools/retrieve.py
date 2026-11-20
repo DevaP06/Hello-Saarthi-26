@@ -10,6 +10,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,11 @@ class Chunk:
 
 # Per-request trace of the last retrieve() call (legs used, hops, boosts) for telemetry.
 last_trace: ContextVar[list] = ContextVar("retrieve_last_trace", default=[])
+
+# Course ids the calling user may read (enrolled or owned). The API sets it per request so an
+# unscoped search never reaches another course's private materials. None = unrestricted
+# (scripts, eval, admins).
+allowed_courses: ContextVar[set[int] | None] = ContextVar("retrieve_allowed_courses", default=None)
 
 
 def _docs_to_chunks(docs, content_type: str) -> list[Chunk]:
@@ -102,9 +108,12 @@ def _targets(
     course_id: int | None,
     video_id: int | None,
 ) -> list[tuple[Path, str]]:
+    allowed = allowed_courses.get()
     if video_id is not None:
         return [(Path("knowledge_base") / "videos" / str(video_id) / "vector_store", "video")]
     if course_id is not None:
+        if allowed is not None and course_id not in allowed:
+            return []
         return [(Path("knowledge_base") / "courses" / str(course_id) / "vector_store", "course_material")]
     types = content_types or ["notes", "books", "video"]
     out: list[tuple[Path, str]] = []
@@ -117,6 +126,8 @@ def _targets(
         if courses_root.exists():
             for d in sorted(courses_root.iterdir()):
                 vs = d / "vector_store"
+                if allowed is not None and (not d.name.isdigit() or int(d.name) not in allowed):
+                    continue
                 if vs.exists():
                     out.append((vs, "course_material"))
     return out
@@ -140,6 +151,32 @@ def _search_faiss(index_dir: Path, query: str, k: int):
         return []
 
 
+def _index_vocab(content_types, course_id, video_id) -> set:
+    """Words that occur in the indexes a query will search (for typo correction)."""
+    from src.retrieval import store
+
+    vocab: set = set()
+    for index_dir, _ in _targets(content_types, course_id, video_id):
+        try:
+            idx = store.load(index_dir) if index_dir.exists() else None
+        except Exception:
+            idx = None
+        if idx is not None:
+            vocab |= set(idx.bm25.idf)
+    return vocab
+
+
+def prepare_query(query, content_types=None, course_id=None, video_id=None):
+    """Abbreviation expansion, unicode-math normalisation and typo correction for one search."""
+    from src.retrieval.preprocess import prepare
+
+    if os.environ.get("QUERY_PREPROCESS", "1").strip().lower() in ("0", "false", "no", "off"):
+        from src.retrieval.preprocess import Prepared
+        return Prepared(query, query, query)
+    vocab = _index_vocab(content_types, course_id, video_id) if _HAS_ENGINE else set()
+    return prepare(query, vocab)
+
+
 def retrieve(
     query: str,
     *,
@@ -153,6 +190,8 @@ def retrieve(
     boost_terms: list[str] | None = None,
 ) -> list[Chunk]:
     """boost_terms (e.g. the student's weak topics) only reorder hits; they never filter."""
+    prepared = prepare_query(query, content_types, course_id, video_id)
+    query = prepared.search_query
     q = f"{material_title or ''} {query}".strip() if material_title else query
     expand = expand_via_graph
     if mode == "dense":
@@ -195,6 +234,8 @@ def retrieve(
         if filtered:
             chunks = filtered
 
+    if prepared.changed:
+        traces.append({"query_preprocess": {"expanded": prepared.expanded, "corrected": prepared.corrected}})
     last_trace.set(traces)
 
     # Several folders (default targets) each return their own top-k: interleave by fused score.

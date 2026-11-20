@@ -63,19 +63,35 @@ def colbert_order(query: str, texts: list[str]) -> tuple[list[int] | None, str]:
 
 
 def cross_encoder_order(query: str, texts: list[str]) -> tuple[list[int] | None, str]:
+    scores, status = cross_encoder_scores(query, texts)
+    if scores is None:
+        return None, status
+    return sorted(range(len(texts)), key=lambda i: scores[i], reverse=True), status
+
+
+def cross_encoder_scores(query: str, texts: list[str]) -> tuple[list[float] | None, str]:
+    """Raw cross-encoder relevance score per text (higher = more relevant), or None if the leg is off."""
     if not _enabled("RETRIEVAL_RERANK"):
         return None, "off"
 
     def _load():
         from sentence_transformers import CrossEncoder
-        return CrossEncoder(os.environ.get("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"))
+
+        kwargs = {}
+        try:  # half precision on a GPU: bge-reranker-v2-m3 needs 1.1 GB instead of 2.2 GB next to the LLM
+            import torch
+            if torch.cuda.is_available() and os.environ.get("RERANK_FP16", "1") != "0":
+                kwargs["model_kwargs"] = {"torch_dtype": torch.float16}
+        except ImportError:
+            pass
+        return CrossEncoder(os.environ.get("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"), **kwargs)
 
     model = _get("rerank", _load)
     if model is None:
         return None, "skipped (sentence-transformers not available)"
     try:
         scores = model.predict([(query, t) for t in texts])
-        return sorted(range(len(texts)), key=lambda i: float(scores[i]), reverse=True), "ok"
+        return [float(s) for s in scores], "ok"
     except Exception as e:
         logger.warning("Cross-encoder rerank failed: %s", e)
         return None, f"error: {e}"

@@ -1,0 +1,84 @@
+# Everything needed to run Saarthi locally (backend + AI core + tests + eval tools), without the
+# multi-GB optional extras. Versions are the ones the 94 tests and all eval runs passed with
+# (laptop ml_env, Nov 2026; same pins worked on Colab).
+#
+#   conda create -n saarthi python=3.10 -y
+#   conda activate saarthi
+#   pip install -r saarthi_backend/requirements-saarthi-env.txt
+#
+# Left out on purpose (the code imports them lazily and falls back without them):
+#   torch / sentence-transformers  -> only for RETRIEVAL_RERANK=1 (reranker is off by default)
+#   docling                        -> PDF parsing falls back to pypdf
+#   PyMuPDF / pdfplumber           -> optional better PDF text extraction
+# Models run in Ollama (qwen2.5:7b, nomic-embed-text), not in Python.
+
+# --- API ---
+fastapi==0.135.2
+starlette==0.52.1
+uvicorn==0.42.0
+watchfiles==1.2.0
+python-multipart==0.0.22
+sse-starlette==3.5.1
+pydantic==2.12.5
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
+itsdangerous==2.2.0
+Jinja2==3.1.6
+websockets==16.1.1
+requests==2.32.5
+
+# --- auth ---
+PyJWT==2.14.0
+passlib==1.7.4
+bcrypt==5.0.0
+email-validator==2.3.0
+cryptography==50.0.2
+
+# --- database ---
+SQLAlchemy==2.0.52
+greenlet>=3.1
+asyncpg==0.31.0
+aiosqlite==0.22.1
+
+# --- LLM / agents ---
+openai==3.13.0
+httpx==0.28.1
+httpcore==1.0.9
+httpx2==2.12.0
+httpcore2==2.12.0
+anyio==4.13.0
+tenacity==9.1.4
+tiktoken==0.14.0
+langsmith==0.12.4
+langchain-core==1.6.3
+langchain-openai==1.6.2
+langchain-community==0.4.2
+langchain-text-splitters==1.1.2
+langchain-classic==1.0.8
+langgraph==1.2.11
+langgraph-checkpoint==4.2.0
+langgraph-prebuilt==1.1.0
+langgraph-sdk==0.4.4
+orjson==3.11.7
+ormsgpack==1.12.2
+xxhash==4.0.1
+
+# --- retrieval / content ---
+faiss-cpu==1.15.0
+rank-bm25==0.2.2
+pypdf==6.18.1
+youtube-transcript-api==1.2.4
+
+# --- maths / code lab / eval ---
+numpy==2.2.6
+scipy==1.15.3
+pandas==2.3.3
+numexpr==2.11.0
+sympy==1.14.0
+matplotlib==3.10.8
+scikit-learn==1.7.1
+
+# --- tests ---
+pytest==9.1.1
+pytest-asyncio==1.4.0
+python-docx==1.2.0

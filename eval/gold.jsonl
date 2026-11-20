@@ -48,3 +48,8 @@
 {"id": "rt-11", "category": "routing", "status": "draft", "source": "data agent", "query": "Analyze the uploaded CSV dataset and give me the column statistics", "expected": {"expert": ["data_analysis_agent"]}}
 {"id": "rt-12", "category": "routing", "status": "draft", "source": "web agent", "query": "What are the latest news about 6G wireless standards this year?", "expected": {"expert": ["web_agent"]}}
 {"id": "rt-13", "category": "routing", "status": "draft", "source": "WBS 3.2.2 router sanitize", "query": "Explain the Nyquist sampling theorem", "expected": {"expert": ["books_agent", "notes_agent", "video_agent"], "forbidden_expert": ["data_analysis_agent"]}}
+{"id": "ret-16", "category": "retrieval", "status": "draft", "query": "What is the time shift property of the FT?", "scope": {"course_id": 1}, "expected": {"materials": ["Lecture 01 Fourier"], "keywords": ["time shift"]}}
+{"id": "ret-17", "category": "retrieval", "status": "draft", "query": "wat is the nyquist rte", "scope": {"course_id": 1}, "expected": {"materials": ["Lecture 01 Fourier"], "keywords": ["nyquist"]}}
+{"id": "ret-18", "category": "retrieval", "status": "draft", "query": "explain the ROC", "scope": {"course_id": 1}, "expected": {"materials": ["Lecture 01 Fourier"], "keywords": ["region of converge", "roc"]}}
+{"id": "ret-19", "category": "retrieval", "status": "draft", "query": "wat is aliassing", "scope": {"course_id": 2}, "expected": {"materials": ["notes", "notes2"], "keywords": ["aliasing"]}}
+{"id": "ret-20", "category": "retrieval", "status": "draft", "query": "Y(jω) = H(jω)X(jω) what does it mean for an LTI system", "scope": {"course_id": 1}, "expected": {"materials": ["Lecture 01 Fourier"], "keywords": ["h(j omega)", "y(j omega)", "convolution"]}}

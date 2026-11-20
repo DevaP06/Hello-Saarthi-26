@@ -1,0 +1,76 @@
+flowchart TD
+    %% Signals Saarthi: AI core, as built (2026-10-19)
+    subgraph UI["Browser (React)"]
+        Chat["Chat / Course chat / Document and video viewer / floating chatbot"]
+        Review["Instructor: AI review tab"]
+        Tools["Study tools: plan, flashcards, quiz, Socratic, code explain"]
+    end
+
+    subgraph API["FastAPI backend"]
+        Auth["JWT auth + retrieval scope<br/>(caller's courses only)"]
+        Stream["POST /api/chat/stream (SSE)"]
+        StudyAPI["Study-tool routes"]
+        ReviewAPI["/api/reviews (staff only)"]
+        Contract["/api/v1/saarthi/* contract<br/>retrieval/search, context"]
+        Admin["/api/admin/ai/metrics"]
+    end
+
+    subgraph TURN["One chat turn (src/)"]
+        Safety["Safety: PII scrub, injection check"]
+        Prep["Query preprocessor<br/>abbreviations, typos, unicode math"]
+        Classify["Query classifier<br/>rules + learned Tier 1/2 model<br/>+ Tier 0 cache check"]
+        Socratic["Socratic planner<br/>hint 1-3, then reveal"]
+        Policy["Policy: tier, top-n, daily caps,<br/>monthly budget flag"]
+        Retrieve["Hybrid retrieval<br/>dense FAISS + BM25 -> RRF<br/>(rerank / ColBERT: GPU, optional)"]
+        Gate{"Coverage gate:<br/>do the excerpts cover the question?"}
+        NotCovered["Fixed 'not covered' reply<br/>(no LLM call)"]
+        LLM["LLM answer from excerpts only"]
+        Verify["Citations + leak guard + critic<br/>-> confidence"]
+        Cache0["Tier 0: semantic cache<br/>cosine >= 0.95 + lexical guard"]
+    end
+
+    subgraph MODELS["Models"]
+        T1["Tier 1: local Ollama<br/>llama3.2 (chat), nomic-embed-text"]
+        T2["Tier 2: cloud model<br/>(OpenAI-compatible, optional)"]
+    end
+
+    subgraph DATA["Data"]
+        Idx[("Course / video indexes<br/>FAISS + BM25 + chunk metadata v1")]
+        CacheDB[("semantic_cache.sqlite")]
+        Trace[("Traces JSONL<br/>no raw user ids")]
+        PG[("Postgres<br/>users, courses, conversations,<br/>answer_reviews, context")]
+    end
+
+    subgraph ING["Ingestion (instructor upload)"]
+        Upload["Upload PDF / DOCX / PPTX / text / YouTube"]
+        Index["Extract -> chunk -> embed -> index<br/>status: queued, running, done"]
+    end
+
+    Chat --> Stream
+    Tools --> StudyAPI
+    Review --> ReviewAPI
+    Stream --> Auth --> Safety --> Prep --> Classify
+    Classify -- "cache hit" --> Cache0 --> Stream
+    Classify --> Socratic --> Policy --> Retrieve --> Gate
+    Gate -- "no" --> NotCovered --> Stream
+    Gate -- "yes" --> LLM --> Verify --> Stream
+    Policy -. "Tier 1" .-> T1
+    Policy -. "Tier 2 if allowed" .-> T2
+    LLM --- T1
+    LLM --- T2
+    Retrieve --> Idx
+    Classify --> CacheDB
+    Verify -- "verified + cited only" --> CacheDB
+    Stream --> Trace
+    Verify -- "low confidence / thumbs down" --> ReviewAPI
+    ReviewAPI --> PG
+    ReviewAPI -- "instructor correction" --> Idx
+    ReviewAPI -- "drop cached answers" --> CacheDB
+    StudyAPI --> Retrieve
+    StudyAPI --> T1
+    Contract --> Retrieve
+    Contract --> PG
+    Admin --> CacheDB
+    Upload --> Index --> Idx
+    Index -- "drop cached answers" --> CacheDB
+    Stream --> PG

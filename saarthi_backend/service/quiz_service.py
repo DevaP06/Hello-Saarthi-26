@@ -200,8 +200,10 @@ async def generate_adaptive_quiz(
 ) -> AdaptiveQuizResponse:
     """Use GPT-4.1 to generate an adaptive quiz based on past attempt analysis."""
     try:
+        from src.safety.guard import scrub_pii
         from src.utils.llm import async_openai, chat_model_name
         client = async_openai()
+        topic = scrub_pii(body.topic)[0]
 
         # Analyze past performance
         avg_score = 0.0
@@ -224,17 +226,23 @@ async def generate_adaptive_quiz(
 
         attempts_text = ""
         if body.pastAttempts:
-            attempts_text = f"\nPast performance on {body.topic}:\n"
+            attempts_text = f"\nPast performance on {topic}:\n"
             for a in body.pastAttempts[-3:]:  # last 3 attempts
                 attempts_text += f"- {a.quizTitle}: {a.score:.0f}%\n"
             attempts_text += f"Average score: {avg_score:.0f}%\n"
 
-        user_prompt = f"""Generate {body.numQuestions} adaptive quiz questions on: {body.topic}
+        from saarthi_backend.service.chat_service import _kb_excerpts
+        excerpts = _kb_excerpts(topic)[:4000]
+        grounding = (
+            f"\n\nCourse excerpts (base every question on these, with the course's own notation; add no outside facts):\n{excerpts}"
+            if excerpts else ""
+        )
+        user_prompt = f"""Generate {body.numQuestions} adaptive quiz questions on: {topic}
 {"Course: " + body.courseTitle if body.courseTitle else ""}
 Target difficulty: {difficulty}{attempts_text}
 
 Focus on making questions that test deep understanding, not just memorization.
-For engineering students studying signals, systems, ML, or algorithms."""
+For engineering students studying signals, systems, ML, or algorithms.{grounding}"""
 
         response = await client.chat.completions.create(
             model=chat_model_name(),
