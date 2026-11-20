@@ -17,6 +17,7 @@ import FileDropzone from '../components/FileDropzone';
 import ConfirmModal from '../components/ConfirmModal';
 import EmptyState from '../components/EmptyState';
 import { useToast } from '../components/Toast';
+import AIReviewPanel from '../components/AIReviewPanel';
 import './CourseDetail.css';
 
 const PAGE_SIZE = 20;
@@ -73,6 +74,11 @@ interface StreamItem {
 }
 
 type DocChatMessage = { role: 'user' | 'assistant'; content: string };
+
+/** AI answers can quote uploaded course text, so escape HTML before the light markdown below
+ *  (security review S2: a poisoned file could otherwise run script in students' browsers). */
+const escapeHtml = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
 const tabs = [
     { id: 'stream', label: 'Stream' },
@@ -912,7 +918,7 @@ export default function CourseDetailPage() {
                     <ArrowLeft size={20} />
                 </button>
                 <div className="cd-cr-tabs">
-                    {tabs.map((tab) => (
+                    {(isInstructor ? [...tabs, { id: 'review', label: 'AI review' }] : tabs).map((tab) => (
                         <button key={tab.id} className={`cd-cr-tab ${activeTab === tab.id ? 'active' : ''}`} onClick={() => setActiveTab(tab.id)}>
                             {tab.label}
                         </button>
@@ -1214,6 +1220,8 @@ export default function CourseDetailPage() {
             )}
 
             {/* ── People Tab ── */}
+            {activeTab === 'review' && isInstructor && courseId && <AIReviewPanel courseId={courseId} />}
+
             {activeTab === 'people' && (
                 <div className="cd-people-container">
                     <div className="cd-people-section">
@@ -1432,7 +1440,7 @@ export default function CourseDetailPage() {
                                                 <div
                                                     className="cd-doc-view-msg-content"
                                                     dangerouslySetInnerHTML={{
-                                                        __html: msg.content
+                                                        __html: escapeHtml(msg.content)
                                                             .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
                                                             .replace(/\*(.+?)\*/g, '<em>$1</em>')
                                                             .replace(/`(.+?)`/g, '<code>$1</code>')
