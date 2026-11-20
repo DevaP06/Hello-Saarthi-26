@@ -123,14 +123,21 @@ Rules:
 - Relate to the DSP/engineering context when courseContext is provided."""
 
 
+def _code_clean(text: str | None) -> str:
+    """Program text keeps its numbers and identifiers; student emails / roll numbers are removed."""
+    from src.safety.guard import scrub_pii
+
+    return scrub_pii(text or "", kinds=("email", "roll"))[0]
+
+
 async def explain_error(body: CodeExplainRequest) -> CodeExplainResponse:
     try:
         client = async_openai()
         context_line = f"\nCourse context: {body.courseContext}" if body.courseContext else ""
         user_prompt = (
             f"Language: {body.language}{context_line}\n\n"
-            f"Code:\n```{body.language}\n{body.code[:3000]}\n```\n\n"
-            f"Error (exit code {body.exitCode}):\n{body.stderr[:1500]}"
+            f"Code:\n```{body.language}\n{_code_clean(body.code)[:3000]}\n```\n\n"
+            f"Error (exit code {body.exitCode}):\n{_code_clean(body.stderr)[:1500]}"
         )
         response = await client.chat.completions.create(
             model=chat_model_name(),
@@ -179,15 +186,15 @@ async def stream_explain_error(body: CodeExplainRequest) -> AsyncGenerator[str, 
             user_prompt = (
                 f"Language: {body.language}{context_line}\n"
                 f"The code ran successfully.\n\n"
-                f"Output:\n{(body.stdout or '')[:600]}\n\n"
-                f"Code:\n{body.code[:1500]}"
+                f"Output:\n{_code_clean(body.stdout)[:600]}\n\n"
+                f"Code:\n{_code_clean(body.code)[:1500]}"
             )
         else:
             user_prompt = (
                 f"Language: {body.language}{context_line}\n"
                 f"Exit code: {body.exitCode}\n"
-                f"Error:\n{body.stderr[:800]}\n\n"
-                f"Code snippet:\n{body.code[:1500]}"
+                f"Error:\n{_code_clean(body.stderr)[:800]}\n\n"
+                f"Code snippet:\n{_code_clean(body.code)[:1500]}"
             )
 
         stream = await client.chat.completions.create(

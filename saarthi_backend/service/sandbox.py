@@ -25,6 +25,22 @@ from src.utils.python_runtime import _is_store_stub, python_argv, python_display
 logger = logging.getLogger(__name__)
 
 TIMEOUT = int(os.environ.get("SANDBOX_TIMEOUT_SEC", "30"))
+
+# Student code must not see the server's secrets. Local runs used to inherit the whole
+# environment (OPENAI_API_KEY, DATABASE_URL, JWT_SECRET, ADMIN_SECRET_TOKEN ...): one
+# `print(os.environ)` in Code Lab was enough to forge an admin token (security review 2026-11-10).
+# Only what interpreters and compilers need to start is passed on.
+_SAFE_ENV_KEYS = (
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR",
+    "HOME", "USERPROFILE", "LANG", "LC_ALL", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS",
+    "CONDA_PREFIX", "JAVA_HOME", "GOROOT", "GOPATH", "GOCACHE", "CARGO_HOME", "RUSTUP_HOME",
+)
+
+
+def child_env(**extra: str) -> dict:
+    env = {k: v for k, v in os.environ.items() if k.upper() in _SAFE_ENV_KEYS}
+    env.update({"PYTHONIOENCODING": "utf-8", "PYTHONNOUSERSITE": "1", **extra})
+    return env
 MEMORY = os.environ.get("SANDBOX_MEMORY", "512m")
 CPUS = os.environ.get("SANDBOX_CPUS", "0.5")
 PIDS_LIMIT = os.environ.get("SANDBOX_PIDS_LIMIT", "64")
@@ -146,7 +162,7 @@ def _run_shell(cmd: str, stdin: str, cwd: str, timeout: int) -> tuple[bool, str,
     try:
         r = subprocess.run(
             cmd, shell=True, input=stdin.encode(),
-            capture_output=True, timeout=timeout, cwd=cwd,
+            capture_output=True, timeout=timeout, cwd=cwd, env=child_env(),
         )
         return (
             r.returncode == 0,
@@ -170,7 +186,7 @@ def _local_python(src: str, stdin: str, cwd: str, timeout: int) -> tuple[bool, s
             timeout=timeout,
             cwd=cwd,
             shell=False,
-            env={**os.environ, "PYTHONEXECUTABLE": argv[0]},
+            env=child_env(PYTHONEXECUTABLE=argv[0]),
         )
         stderr = r.stderr.decode(errors="replace")
         if r.returncode != 0 and "Microsoft Store" in stderr:

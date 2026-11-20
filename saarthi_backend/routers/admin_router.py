@@ -12,6 +12,7 @@ Endpoints:
   GET    /api/admin/kb/stats              — KB health stats for all agents
 """
 
+import hmac
 import json
 import logging
 import os
@@ -22,6 +23,9 @@ from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from saarthi_backend.deps import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +47,7 @@ def verify_admin(authorization: str = Header(...)) -> None:
     expected = os.environ.get("ADMIN_SECRET_TOKEN", "").strip()
     if not expected:
         raise HTTPException(status_code=503, detail="Admin token not configured on server.")
-    if token != expected:
+    if not hmac.compare_digest(token.encode(), expected.encode()):  # constant-time comparison
         raise HTTPException(status_code=403, detail="Unauthorized.")
 
 
@@ -362,16 +366,23 @@ def kb_stats():
 
 
 @router.get("/ai/metrics", dependencies=[Depends(verify_admin)])
-def ai_metrics(days: int = 14):
+async def ai_metrics(days: int = 14, db: AsyncSession = Depends(get_db)):
     """AI-emitted metrics for Product / researcher dashboards: semantic-cache hit rate
     (target >= 30% after 2 weeks), today's token use per tier, and the tier config."""
     from src.cache.semantic_cache import get_cache
     from src.utils import budget
     from src.utils.llm import chat_model_name, tier2_configured
 
+    from saarthi_backend.dao.review_dao import AnswerReviewDAO
+
     allowed, reason = budget.cloud_allowed()
+    try:
+        reviews = await AnswerReviewDAO.count_by_course(db)
+    except Exception:  # table missing on an un-migrated DB: metrics must still load
+        reviews = {}
     return {
         "cache": get_cache().stats(days=days),
+        "reviews": {k: reviews.get(k, 0) for k in ("open", "corrected", "dismissed")},
         "usage_today": budget.summary(),
         "tiers": {
             "tier1_model": chat_model_name(tier=1),
