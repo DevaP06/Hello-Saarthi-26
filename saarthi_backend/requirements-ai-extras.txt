@@ -1,0 +1,19 @@
+# Extra packages for the AI team's tooling. They are NOT needed to run the API (requirements.txt is the
+# pinned runtime freeze and is left untouched). Install on top of it:
+#
+#     pip install -r saarthi_backend/requirements.txt
+#     pip install -r saarthi_backend/requirements-ai-extras.txt
+#
+# Tests (pytest saarthi_backend/tests/test_ai_*.py): the API tests run the real routers on an
+# in-process SQLite database and skip themselves when aiosqlite is missing.
+aiosqlite>=0.20
+
+# Training the Tier-1 / Tier-2 query classifier (eval/classifier/train_classifier.py). Inference only
+# needs numpy, so the server does not need scikit-learn.
+scikit-learn>=1.5
+
+# Optional retrieval upgrades (spec 3.1.2). Both need a GPU to be worthwhile, and retrieval falls back
+# to the hybrid dense + BM25 path without them. RETRIEVAL_RERANK=1 and RETRIEVAL_COLBERT=1 enable them; see in
+# PART_B_AI.md. Uncomment on the GPU machine.
+# sentence-transformers>=3.0
+# ragatouille>=0.0.8

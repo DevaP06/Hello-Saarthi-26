@@ -85,11 +85,13 @@ async def delete_video(
     """Delete video (admin/teacher). Must be declared before GET for same path."""
     if user.role not in ("admin", "teacher"):
         raise ValidationError("Forbidden.", details=None)
+    existing = await video_service.get_video(db, video_id)
+    course_id = existing.course_id if existing else None  # read before the row is gone
     deleted = await video_service.delete_video(db, video_id)
     if not deleted:
         raise NotFoundError("Video not found.", details=None)
     from saarthi_backend.service.indexing_service import delete_video_transcript_index
-    delete_video_transcript_index(video_id)
+    delete_video_transcript_index(video_id, course_id=course_id)
     await db.commit()
 
 
@@ -141,7 +143,7 @@ async def create_video(
     await db.commit()
     # Auto-fetch YouTube transcript in background — no admin action needed
     from saarthi_backend.service.indexing_service import auto_index_youtube_video
-    auto_index_youtube_video(v.id, v.title, v.url or "", v.embed_url)
+    auto_index_youtube_video(v.id, v.title, v.url or "", v.embed_url, course_id=v.course_id)
     return _video_to_response(v)
 
 
@@ -163,7 +165,7 @@ async def upload_transcript(
     video.transcript_text = body.transcriptText
     await db.commit()
     from saarthi_backend.service.indexing_service import index_video_transcript_background
-    index_video_transcript_background(video_id, video.title, body.transcriptText)
+    index_video_transcript_background(video_id, video.title, body.transcriptText, course_id=video.course_id)
     return {"status": "indexing", "videoId": video_id}
 
 

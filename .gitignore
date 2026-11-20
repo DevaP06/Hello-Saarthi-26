@@ -97,3 +97,6 @@ VideoDownloadPackage/
 
 # AI eval run outputs (gold.jsonl and scripts are tracked)
 eval/reports/
+
+# AI regression tests are tracked (the generic "tests/" rule above would otherwise hide them)
+!saarthi_backend/tests/

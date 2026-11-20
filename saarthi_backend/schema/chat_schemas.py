@@ -239,6 +239,7 @@ class AnswerFeedbackRequest(BaseModel):
     contextVideoId: Optional[int] = None
     cacheEntryId: Optional[int] = None
     conversationId: Optional[str] = None
+    answer: Optional[str] = Field(None, max_length=8000, description="The rated answer, shown to the instructor on thumbs-down.")
 
 
 class AnswerFeedbackResponse(BaseModel):

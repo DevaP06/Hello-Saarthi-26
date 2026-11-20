@@ -50,8 +50,18 @@ def _key() -> str:
     )
 
 
+def _loopback(url: str | None) -> str | None:
+    """`localhost` -> `127.0.0.1`. On Windows every new connection to `localhost` first tries IPv6
+    (::1), which Ollama does not listen on, and waits about 2 s before falling back to IPv4
+    (measured: 2,050 ms vs 20 ms per connection). Each answer opens a new connection, so this
+    alone added about 2 s to every chat turn and every embedding call that needed a new socket."""
+    if url and "://localhost" in url:
+        return url.replace("://localhost", "://127.0.0.1", 1)
+    return url
+
+
 def _base() -> str | None:
-    return (os.environ.get("OPENAI_BASE_URL") or "").strip() or None
+    return _loopback((os.environ.get("OPENAI_BASE_URL") or "").strip() or None)
 
 
 def tier2_configured() -> bool:
@@ -62,12 +72,12 @@ def _tier_settings(tier: int) -> dict:
     """base_url / api_key / model for a tier (Tier 2 falls back to Tier 1 if unset)."""
     if tier == 2 and tier2_configured():
         return {
-            "base_url": (os.environ.get("CLOUD_BASE_URL") or "").strip() or None,
+            "base_url": _loopback((os.environ.get("CLOUD_BASE_URL") or "").strip() or None),
             "api_key": os.environ.get("CLOUD_API_KEY") or _key(),
             "model": os.environ["CLOUD_CHAT_MODEL"].strip(),
         }
     return {
-        "base_url": (os.environ.get("LOCAL_BASE_URL") or "").strip() or _base(),
+        "base_url": _loopback((os.environ.get("LOCAL_BASE_URL") or "").strip() or None) or _base(),
         "api_key": os.environ.get("LOCAL_API_KEY") or _key(),
         "model": (os.environ.get("LOCAL_CHAT_MODEL") or "").strip() or os.environ.get("CHAT_MODEL") or "gpt-4.1",
     }
@@ -127,6 +137,17 @@ def _usage_callback(tier: int, model: str):
     return _Usage()
 
 
+def reasoning_body(tier: int) -> dict:
+    """Extra request fields for "thinking" models on the local tier. LLM_REASONING_EFFORT=none turns
+    qwen3's thinking off through Ollama's OpenAI-compatible API (measured: `think: false` and the
+    `/no_think` tag are ignored there; with thinking on, a one-line answer took 25-50 s).
+    Unset = send nothing, so other models and a cloud Tier 2 are unchanged."""
+    effort = (os.environ.get("LLM_REASONING_EFFORT") or "").strip()
+    if not effort or (tier == 2 and tier2_configured()):
+        return {}
+    return {"reasoning_effort": effort}
+
+
 def chat_llm(*, temperature: float = 0, max_tokens: int | None = None, fast: bool = False, tier: int | None = None, **extra):
     from langchain_openai import ChatOpenAI
 
@@ -148,6 +169,9 @@ def chat_llm(*, temperature: float = 0, max_tokens: int | None = None, fast: boo
             # langchain-openai sends `max_completion_tokens`, which Ollama's OpenAI-compatible
             # API ignores (a 1B router once generated 40,960 tokens). Send the legacy field too.
             kwargs["extra_body"] = {**(extra.pop("extra_body", None) or {}), "max_tokens": max_tokens}
+    think = reasoning_body(t)
+    if think:
+        kwargs["extra_body"] = {**(kwargs.get("extra_body") or extra.pop("extra_body", None) or {}), **think}
     kwargs.update(extra)
     return ChatOpenAI(**kwargs)
 
@@ -180,9 +204,21 @@ def embeddings():
 def async_openai(*, tier: int | None = None):
     from openai import AsyncOpenAI
 
-    cfg = _tier_settings(effective_tier(tier))
+    t = effective_tier(tier)
+    cfg = _tier_settings(t)
     kwargs: dict = {"api_key": cfg["api_key"]}
     if cfg["base_url"]:
         kwargs["base_url"] = cfg["base_url"]
         kwargs["default_headers"] = _openrouter_headers()
-    return AsyncOpenAI(**kwargs)
+    client = AsyncOpenAI(**kwargs)
+    think = reasoning_body(t)
+    if think:
+        # Every service calls client.chat.completions.create(); add the field once here.
+        create = client.chat.completions.create
+
+        async def _create(*args, **kw):
+            kw["extra_body"] = {**think, **(kw.get("extra_body") or {})}
+            return await create(*args, **kw)
+
+        client.chat.completions.create = _create
+    return client

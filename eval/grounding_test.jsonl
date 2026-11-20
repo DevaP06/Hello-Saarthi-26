@@ -10,3 +10,10 @@
 {"id": "gr-10", "query": "What is the capital of France?", "scope": {"course_id": 2}, "covered": false}
 {"id": "gr-11", "query": "Explain Kirchhoff's voltage law", "scope": {"course_id": 2}, "covered": false}
 {"id": "gr-12", "query": "What is the orange zebra theorem?", "scope": {"course_id": 2}, "covered": false}
+{"id": "gr-13", "query": "What causes aliasing and how do we prevent it?", "scope": {"course_id": 2}, "covered": true}
+{"id": "gr-14", "query": "what is the FT of a rectangular pulse?", "scope": {"course_id": 1}, "covered": true}
+{"id": "gr-15", "query": "what is the nyquist rte", "scope": {"course_id": 1}, "covered": true}
+{"id": "gr-16", "query": "explain the ROC for a right sided signal", "scope": {"course_id": 1}, "covered": true}
+{"id": "gr-17", "query": "How do I fix a null pointer exception in Java?", "scope": {"course_id": 1}, "covered": false}
+{"id": "gr-18", "query": "What causes inflation and how do we prevent it?", "scope": {"course_id": 2}, "covered": false}
+{"id": "gr-19", "query": "What is the best way to cook pasta?", "scope": {"course_id": 1}, "covered": false}

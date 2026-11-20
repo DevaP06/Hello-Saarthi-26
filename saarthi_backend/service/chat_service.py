@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 from src.utils.llm import async_openai, chat_model_name
 
 
+def _clean(text: str | None, names: list[str] | None = None) -> str:
+    """Strip student PII (name, email, phone, roll number) from free text before an LLM sees it."""
+    from src.safety.guard import scrub_pii
+
+    return scrub_pii(text, names)[0] if text else (text or "")
+
+
 def _kb_excerpts(query: str, course_id: int | None = None) -> str:
     """Ground study tools in retrieve(). Empty string if nothing indexed."""
     try:
@@ -139,16 +146,26 @@ def _apply_video_context(
 
 
 async def _kb_chat_reply(message: str, history: list[dict]) -> str | None:
-    """Answer from the fixed knowledge base (src/knowledge_base/gemini_rag.py) when its index is built.
+    """Answer from the Gemini knowledge-base index (src/knowledge_base/gemini_rag.py).
 
-    Returns None to fall back to the original chat pipeline: index missing, or CHAT_SOURCE=legacy.
-    Sources are appended as "[Source: file, p.N]" lines, which the Chat page shows as badges.
+    Default for now: Gemini answers whenever its index is built. Once our own model is deployed,
+    set CHAT_SOURCE=core and chat goes through the Saarthi AI core instead. Returns None to use the
+    AI core (CHAT_SOURCE=core, or the Gemini index is missing).
+
+    Why the AI core should take over once our model is deployed (AI team, Nov 2026): this path skips the core's course scoping
+    (one index serves every course), the coverage gate, Socratic hints, the cache and token budget,
+    the injection guard, the instructor review queue and traces, and it sends questions to an
+    external free-tier API, which shows quota errors under load. The AI core runs on our own
+    model (qwen3-saarthi-14b, fine-tuned on the course lectures; any OpenAI-compatible model
+    works), so it costs nothing per question and keeps course data on our servers. Gemini can
+    still be used behind the core as a Tier 2 model (CLOUD_CHAT_MODEL / CLOUD_BASE_URL).
+    The text passed in is already PII-scrubbed. Sources are appended as "[Source: file, p.N]".
     """
     import os
     from fastapi.concurrency import run_in_threadpool
     from src.knowledge_base import gemini_rag
 
-    if os.environ.get("CHAT_SOURCE", "kb").lower() == "legacy" or not gemini_rag.index_ready():
+    if os.environ.get("CHAT_SOURCE", "gemini").strip().lower() in ("core", "legacy") or not gemini_rag.index_ready():
         return None
     # Strip earlier source lines so they do not crowd the model's context.
     clean = [
@@ -187,11 +204,20 @@ async def send_message(
     existing = await ChatMessageDAO.list_by_conversation(db, conversation_id)
     user_msg = await ChatMessageDAO.create(db, conversation_id, "user", message)
     history = [{"role": m.role, "content": m.content} for m in existing]
-    kb_reply = await _kb_chat_reply(message, history)
+    # The signed-in student's own name is scrubbed too (a name typed without "my name is" is otherwise kept).
+    from saarthi_backend.model import User
+
+    owner = await db.get(User, user_id)
+    names = [owner.full_name] if owner is not None and getattr(owner, "full_name", None) else None
+    history = [{"role": h["role"], "content": _clean(h["content"], names)} for h in history]
+    # Gemini knowledge-base path by default; the Saarthi AI core when CHAT_SOURCE=core (see _kb_chat_reply).
+    # Either way the message and history are PII-scrubbed first.
+    clean_message = _clean(message, names)
+    kb_reply = await _kb_chat_reply(clean_message, history)
     if kb_reply is not None:
         assistant_content = kb_reply
     else:
-        prompt_for_ai, is_grounded = _apply_document_context(message, context_material_title, course_id=course_id)
+        prompt_for_ai, is_grounded = _apply_document_context(clean_message, context_material_title, course_id=course_id)
         history.append({"role": "user", "content": prompt_for_ai})
         if is_grounded:
             assistant_content = await run_document_chat(prompt_for_ai, history[:-1])
@@ -262,6 +288,8 @@ async def stateless_message(
                 answer = tutor.not_covered(context_material_title)
             else:
                 answer = await run_grounded_answer(question, g.chunks, history)
+                if answer.lower().replace("’", "'").startswith(tutor.NOT_COVERED_MARK):
+                    reply_mode = "not_covered"  # the model found no answer in the excerpts
         else:
             history.append({"role": "user", "content": question})
             answer = await run_chat(question, history, mind_mode=mind_mode)
@@ -326,10 +354,12 @@ async def generate_study_plan(
     db: AsyncSession,
     user_id: int,
     body: StudyPlanRequest,
+    student_names: list[str] | None = None,
 ) -> StudyPlanResponse:
     """Call GPT-4.1 to generate a personalized weekly study plan."""
     try:
         client = async_openai()
+        focus_area = _clean(body.focusArea, student_names)
 
         courses_text = "\n".join(
             f"- {c.title} ({c.code}): {c.progressPercent}% complete"
@@ -347,8 +377,8 @@ async def generate_study_plan(
             for q in body.recentQuizScores
         ) or "No recent quiz data."
 
-        focus_text = f"\nStudent wants to focus on: {body.focusArea}" if body.focusArea else ""
-        topic_q = body.focusArea or (body.courses[0].title if body.courses else "engineering")
+        focus_text = f"\nStudent wants to focus on: {focus_area}" if focus_area else ""
+        topic_q = focus_area or (body.courses[0].title if body.courses else "engineering")
 
         user_prompt = f"""Student profile:
 Available hours per day: {body.hoursPerDay}h{focus_text}
@@ -429,21 +459,25 @@ Return ONLY valid JSON:
 }"""
 
 
-async def socratic_challenge(body: SocraticChallengeRequest) -> SocraticChallengeResponse:
+async def socratic_challenge(
+    body: SocraticChallengeRequest, student_names: list[str] | None = None
+) -> SocraticChallengeResponse:
     """Generate a Socratic counter-challenge to a student's claim."""
     try:
         client = async_openai()
+        topic = _clean(body.topic, student_names)
+        claim = _clean(body.claim, student_names)
         difficulty_map = {
             "gentle": "Be encouraging and ask one soft question.",
             "moderate": "Challenge them firmly but fairly.",
             "rigorous": "Be relentless. Find every flaw. Don't accept vague answers.",
         }
         user_prompt = (
-            f"Topic: {body.topic}\n"
+            f"Topic: {topic}\n"
             + (f"Course: {body.courseTitle}\n" if body.courseTitle else "")
-            + f"Student's claim: \"{body.claim}\"\n"
+            + f"Student's claim: \"{claim}\"\n"
             f"Difficulty level: {difficulty_map[body.difficulty]}\n\n"
-            f"Course excerpts (use these facts):\n{_kb_excerpts(body.topic)}"
+            f"Course excerpts (use these facts):\n{_kb_excerpts(topic)}"
         )
         response = await client.chat.completions.create(
             model=chat_model_name(),
@@ -494,7 +528,8 @@ Rules:
 - mastery: derive from quiz scores where topic matches; default 0.5 if unknown
 - prereqs: list ids of concepts that must be understood first
 - Keep ids lowercase_with_underscores
-- Cover foundational → advanced progression"""
+- Cover foundational → advanced progression
+- If course excerpts are provided, take the concepts from them (their notation and topic names); use general curriculum knowledge only to order and link them"""
 
 
 async def generate_concept_graph(
@@ -513,7 +548,10 @@ async def generate_concept_graph(
             model=chat_model_name(),
             messages=[
                 {"role": "system", "content": _CONCEPT_GRAPH_SYSTEM},
-                {"role": "user", "content": f"Course: {course_title}\n\nQuiz performance:\n{scores_text}"},
+                {"role": "user", "content": (
+                    f"Course: {course_title}\n\nQuiz performance:\n{scores_text}"
+                    f"\n\nCourse excerpts:\n{_kb_excerpts(course_title)[:4000] or '(none indexed yet)'}"
+                )},
             ],
             temperature=0.3,
             max_tokens=2000,
@@ -569,7 +607,7 @@ async def predict_exam_topics(body: ExamPredictionRequest) -> ExamPredictionResp
             f"- {q.quizTitle}: {q.score:.0f}%" + (f" (weak: {', '.join(q.weakTopics)})" if q.weakTopics else "")
             for q in body.recentQuizScores
         ) or "No quiz data."
-        notes_text = ", ".join(body.notesTopics) if body.notesTopics else "No notes data."
+        notes_text = _clean(", ".join(body.notesTopics)) if body.notesTopics else "No notes data."
 
         user_prompt = (
             f"Course: {body.courseTitle}\n"
@@ -697,15 +735,17 @@ async def generate_flashcards(
     body: FlashcardDeckRequest,
     db: AsyncSession | None = None,
     user_id: int | None = None,
+    student_names: list[str] | None = None,
 ) -> FlashcardDeckResponse:
     """Extract flashcards and APPEND them to the user's saved library."""
     try:
         client = async_openai()
+        topic = _clean(body.topic, student_names)
         user_prompt = (
-            f"Topic: {body.topic}\n"
+            f"Topic: {topic}\n"
             + (f"Course: {body.courseTitle}\n" if body.courseTitle else "")
-            + f"Generate up to {body.maxCards} flashcards from this text:\n\n{body.sourceText[:6000]}"
-            f"\n\nRetrieved course excerpts (prefer these):\n{_kb_excerpts(body.topic)[:4000]}"
+            + f"Generate up to {body.maxCards} flashcards from this text:\n\n{_clean(body.sourceText, student_names)[:6000]}"
+            f"\n\nRetrieved course excerpts (prefer these):\n{_kb_excerpts(topic)[:4000]}"
         )
         messages = [
             {"role": "system", "content": _FLASHCARD_SYSTEM},

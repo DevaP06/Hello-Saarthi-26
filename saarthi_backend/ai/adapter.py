@@ -371,6 +371,12 @@ async def run_grounded_answer(
         )
         _record_response_usage(response, chat_model_name())
         answer = _clean_response((response.choices[0].message.content or "").strip())
+        cut = _refusal_start(answer)
+        if cut is not None:  # same rule as the streaming path (_emit_reply)
+            head = answer[:cut].rstrip()
+            if not _substantive(head):
+                return tutor.not_covered(course_name)
+            answer = head
         return answer + sources_suffix(answer, chunks)
     except asyncio.TimeoutError:
         return "The request took too long. Please try a shorter question."
@@ -495,7 +501,17 @@ def _sse_status(stage: str, detail: str = "") -> str:
     return f"event: status\ndata: {_json.dumps({'stage': stage, 'detail': detail})}\n\n"
 
 
-async def _stream_llm_tokens(messages: list[dict], tier: int | None = None) -> AsyncGenerator[str, None]:
+def _tier1_concise(concise: bool, tier: int | None, system_extra: str) -> bool:
+    """Short answers for questions the classifier rated simple (requested Tier 1), served on Tier 1,
+    that are not Socratic hint / full-solution turns. Complex questions keep full-length answers."""
+    if not concise or os.environ.get("TIER1_CONCISE", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    return effective_tier(tier) == 1 and not (system_extra or "").strip()
+
+
+async def _stream_llm_tokens(
+    messages: list[dict], tier: int | None = None, max_tokens: int = 3000
+) -> AsyncGenerator[str, None]:
     t = effective_tier(tier)  # resolve once so client and model always match
     model = chat_model_name(tier=t)
     client = async_openai(tier=t)
@@ -503,7 +519,7 @@ async def _stream_llm_tokens(messages: list[dict], tier: int | None = None) -> A
         model=model,
         messages=messages,
         temperature=0.3,
-        max_tokens=3000,
+        max_tokens=max_tokens,
         stream=True,
     )
     out_chars = 0
@@ -514,6 +530,12 @@ async def _stream_llm_tokens(messages: list[dict], tier: int | None = None) -> A
                 out_chars += len(delta)
                 yield _sse_data(delta)
     finally:
+        # Close the HTTP stream explicitly: when the reply is cut early (prompt leak, the model's own
+        # refusal) an unclosed stream logged "generator didn't stop after athrow()" tracebacks.
+        try:
+            await stream.close()
+        except Exception:  # noqa: BLE001 - already closed / connection gone
+            pass
         prompt_chars = sum(len(str(m.get("content", ""))) for m in messages)
         budget.record(t, model, prompt_chars // 4, out_chars // 4, estimated=True)
 
@@ -607,6 +629,19 @@ async def run_chat_stream(
         yield "data: [DONE]\n\n"
 
 
+def _refusal_start(text: str) -> int | None:
+    """Index where the model starts writing the "not covered" sentence, or None."""
+    from src.prompts.tutor import NOT_COVERED_MARK
+
+    i = (text or "").lower().replace("\u2019", "'").find(NOT_COVERED_MARK)
+    return None if i < 0 else i
+
+
+def _substantive(text: str) -> bool:
+    """True when there is a real answer before the refusal (not just "Sure," or a heading)."""
+    return sum(ch.isalnum() for ch in text or "") >= 40
+
+
 async def _emit_reply(
     reply_mode: str,
     query: str,
@@ -620,6 +655,7 @@ async def _emit_reply(
     course_name: str | None = None,
     computed: str = "",
     critic_ok: bool | None = None,
+    concise: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Write the student-facing reply for one of the reply modes and emit meta + [DONE].
 
@@ -630,7 +666,7 @@ async def _emit_reply(
     """
     import json as _json
     from src.prompts import tutor
-    from src.safety.guard import SAFE_REFUSAL, leaks_prompt
+    from src.safety.guard import LEAK_HOLD_CHARS, SAFE_REFUSAL, leaks_prompt
     from src.tools.citations import excerpts_block, is_cited, sources_suffix
     from src.tools.grounding import confidence
 
@@ -639,10 +675,15 @@ async def _emit_reply(
         for m in conversation_history[-MEMORY_MESSAGES:]
         if m.get("role") in ("user", "assistant") and m.get("content")
     ]
+    max_tokens = 3000
     if reply_mode == "grounded":
         excerpts = excerpts_block(chunks)
         user_msg = tutor.hint_user(query, excerpts) if is_hint_turn(system_extra) else tutor.grounded_user(query, excerpts)
-        messages = [{"role": "system", "content": tutor.grounded_system(course_name, system_extra)}, *history_msgs,
+        system = tutor.grounded_system(course_name, system_extra)
+        if _tier1_concise(concise, tier, system_extra):
+            system += "\n" + tutor.concise_rule()
+            max_tokens = int(os.environ.get("TIER1_MAX_TOKENS", "700"))
+        messages = [{"role": "system", "content": system}, *history_msgs,
                     {"role": "user", "content": user_msg}]
         meta["citations"] = citations_from_chunks(chunks)
     elif reply_mode == "compute":
@@ -658,14 +699,54 @@ async def _emit_reply(
         meta["citations"] = []
 
     out: list[str] = []
+    mixed_refusal = model_refused = False
     if reply_mode == "not_covered":
         text = tutor.not_covered(course_name)
         out.append(text)
         yield _sse_data(text)
     else:
-        async for tok in _stream_llm_tokens(messages, tier=tier):
-            out.append(tok[6:].rstrip("\n").replace("\\n", "\n"))
-            yield tok
+        # Stream with a short hold-back: if the text so far quotes the system prompt, stop before
+        # the quoted part reaches the student (it used to be shown, then followed by a notice).
+        pending = ""
+        hold = max(LEAK_HOLD_CHARS, len(tutor.NOT_COVERED_MARK) + 8)
+        tokens = _stream_llm_tokens(messages, tier=tier, max_tokens=max_tokens)
+        try:
+            async for tok in tokens:
+                piece = tok[6:].rstrip("\n").replace("\\n", "\n")
+                out.append(piece)
+                pending += piece
+                joined = "".join(out)
+                if leaks_prompt(joined):
+                    pending = ""
+                    break
+                cut = _refusal_start(joined) if reply_mode == "grounded" else None
+                if cut is not None:
+                    # The model wrote our "not covered" sentence itself. After a real answer it only
+                    # confuses the student, so the answer stops there and goes to review; with no
+                    # answer before it, the turn is a refusal (no Sources, review queue).
+                    head = joined[:cut]
+                    sent = len(joined) - len(pending)
+                    pending = head[sent:] if len(head) > sent else ""
+                    out = [head]
+                    if _substantive(head):
+                        mixed_refusal = True
+                    else:
+                        model_refused = True
+                    break
+                if len(pending) > hold:
+                    yield _sse_data(pending[:-hold])
+                    pending = pending[-hold:]
+        finally:
+            await tokens.aclose()
+        if model_refused:
+            reply_mode = "not_covered"
+            meta["citations"] = []
+            text = tutor.not_covered(course_name)
+            out = [text]
+            pending = ""
+            yield _sse_data(text)
+        if pending:
+            yield _sse_data(pending.rstrip())
         if reply_mode == "grounded":
             suffix = sources_suffix("".join(out), chunks)
             if suffix:
@@ -685,6 +766,10 @@ async def _emit_reply(
     )
     if leaked:
         conf, reasons = "low", reasons + ["answer quoted system instructions"]
+    if mixed_refusal:
+        conf, reasons = "low", reasons + ["the model was unsure the materials cover this"]
+    if model_refused:
+        reasons = reasons + ["the model found no answer in the retrieved excerpts"]
     meta.update({"confidence": conf, "confidence_reasons": reasons, "reply_mode": reply_mode})
     if sink is not None:
         sink.update({
@@ -710,8 +795,12 @@ async def stream_scoped_answer(
     course_name: str | None = None,
     meta_extra: dict | None = None,
     sink: dict | None = None,
+    steps: list[dict] | None = None,
+    concise: bool = False,
 ) -> AsyncGenerator[str, None]:
-    """Course / material / video scoped turn: no graph, answer only from `grounding.chunks`."""
+    """Course / material / video scoped turn: no graph, answer only from `grounding.chunks`.
+    `steps` (planning mode) are the visible retrieval steps, sent as react_steps.
+    `concise`: the classifier rated the question simple, so a short answer is enough."""
     yield _sse_status("generating", "Reading your course materials")
     if kind == "smalltalk":
         reply_mode = "general"
@@ -721,8 +810,11 @@ async def stream_scoped_answer(
         reply_mode = "not_covered"
     if sink is not None:
         sink["covered"] = grounding.covered
+    scoped_meta = dict(meta_extra or {})
+    if steps:
+        scoped_meta["react_steps"] = steps
     async for frame in _emit_reply(
-        reply_mode, query, grounding.chunks, conversation_history, meta=dict(meta_extra or {}), sink=sink,
-        tier=tier, system_extra=system_extra, course_name=course_name,
+        reply_mode, query, grounding.chunks, conversation_history, meta=scoped_meta, sink=sink,
+        tier=tier, system_extra=system_extra, course_name=course_name, concise=concise,
     ):
         yield frame

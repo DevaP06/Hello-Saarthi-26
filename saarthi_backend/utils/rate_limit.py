@@ -10,6 +10,7 @@ _buckets: dict[str, Tuple[int, float]] = {}
 RATE_LIMIT_GENERAL = (300, 60)   # 300/min per IP
 RATE_LIMIT_AUTH = (20, 60)       # 20/min per IP for login/signup
 RATE_LIMIT_UPLOAD = (20, 60)    # 20/min per IP for upload
+RATE_LIMIT_ANON_CHAT = (10, 60)  # 10/min per IP for the signed-out chat widget (each call costs model time)
 RATE_LIMIT_MATERIAL_FILE = (120, 60)  # 120/min per IP for material file
 
 

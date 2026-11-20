@@ -266,10 +266,17 @@ def _extract_pdf_text_sync(content: bytes, filename: str) -> str:
     return ""
 
 
+def _no_contact_details(text: str) -> str:
+    from src.safety.guard import scrub_pii
+
+    return scrub_pii(text or "", kinds=("email", "phone", "roll"))[0]
+
+
 async def _ai_parse_syllabus(text: str, instructor_name: str) -> CoursePreview | None:
     """Send syllabus text to Claude/GPT and get back structured course JSON."""
     try:
         client = async_openai()
+        text = _no_contact_details(text)
 
         prompt = (
             "You are helping a teacher set up their course on Saarthi.\n"
@@ -343,6 +350,7 @@ async def _ai_classify_message_with_file(message: str, filename: str, courses: l
 
         course_list = json.dumps([{"id": c["id"], "title": c["title"]} for c in courses[:10]])
         file_context = f'\nUploaded file: "{filename}"' if filename else ""
+        message = _no_contact_details(message)
 
         prompt = (
             "A teacher sent this message (and possibly a file). Classify their intent.\n\n"
@@ -648,7 +656,7 @@ async def execute_playlist_import(
     await db.commit()
 
     for video in created:
-        auto_index_youtube_video(video.id, video.title, video.url or "", video.embed_url)
+        auto_index_youtube_video(video.id, video.title, video.url or "", video.embed_url, course_id=course_id)
     return {"videosAdded": len(created), "titles": [v.title for v in created]}
 
 
