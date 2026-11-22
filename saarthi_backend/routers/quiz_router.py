@@ -25,6 +25,7 @@ from saarthi_backend.schema.quiz_schemas import (
     QuizResponse,
 )
 from saarthi_backend.service import course_service, quiz_service
+from saarthi_backend.service.access_scope import retrieval_scope
 from saarthi_backend.utils.exceptions import ForbiddenError, NotFoundError, ValidationError
 
 router = APIRouter(prefix="/quizzes", tags=["quizzes"])
@@ -386,6 +387,7 @@ async def list_my_attempts(
 @router.post("/generate", response_model=AdaptiveQuizResponse)
 async def generate_adaptive_quiz(
     body: AdaptiveQuizRequest,
+    _scope: Annotated[set[int] | None, Depends(retrieval_scope)],
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
@@ -410,9 +412,10 @@ class GroundedMCQRequest(BaseModel):
     materialTitle: str | None = None
 
 
-@router.post("/generate-grounded")
+@router.post("/generate-grounded", response_model=dict)
 async def generate_grounded_mcqs(
     body: GroundedMCQRequest,
+    _scope: Annotated[set[int] | None, Depends(retrieval_scope)],
     user: Annotated[User, Depends(get_current_user)],
 ):
     """MCQs written only from this course's indexed materials; every question cites its

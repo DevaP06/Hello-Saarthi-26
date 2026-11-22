@@ -29,20 +29,37 @@ _SYSTEM = (
 )
 
 
+_JSON_BACKSLASH = re.compile(r"\\\\|\\(?=[A-Za-z]{2,})|\\(?![\\\"/bfnrtu])")
+
+
+def _latex_safe(text: str) -> str:
+    """Models write LaTeX inside JSON strings (\\int, \\frac, \\( ... \\)), which is invalid JSON.
+    Double a backslash that starts a LaTeX command or an escape JSON does not know; keep
+    existing double backslashes, \\" and \\uXXXX. qwen2.5:7b lost 18 of 30 MCQs to this."""
+    return _JSON_BACKSLASH.sub(lambda m: m.group(0) if m.group(0) == "\\\\" else "\\\\", text)
+
+
+def _loads(text: str):
+    for candidate in (text, _latex_safe(text)):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def _parse(raw: str) -> list[dict]:
     raw = raw or ""
     if "```" in raw:
         raw = raw.split("```", 2)[1]
         raw = raw.split("\n", 1)[1] if raw.lstrip().lower().startswith("json") else raw
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
+    data = _loads(raw)
+    if data is None:
         m = re.search(r"\{.*\}", raw, re.S)
         if not m:
             return []
-        try:
-            data = json.loads(m.group(0))
-        except json.JSONDecodeError:
+        data = _loads(m.group(0))
+        if data is None:
             return []
     items = data.get("questions") if isinstance(data, dict) else data
     return items if isinstance(items, list) else []
@@ -65,6 +82,15 @@ def _valid(q: dict, labels: list[str]) -> dict | None:
     if match is None:
         return None
     return {"question": question, "options": opts, "answer_index": ans, "explanation": explanation, "source": match}
+
+
+def _shuffle_options(q: dict, rng) -> dict:
+    """Shuffle the four options and move answer_index with the correct one. Measured 2026-11-19: every
+    model put the correct answer on option A far too often (qwen3:14b 57 %, the fine-tune 62 %), which
+    lets students guess. Only the order changes; question, options, explanation and source stay the same."""
+    order = list(range(len(q["options"])))
+    rng.shuffle(order)
+    return {**q, "options": [q["options"][i] for i in order], "answer_index": order.index(q["answer_index"])}
 
 
 def generate_mcqs(
@@ -107,6 +133,11 @@ def generate_mcqs(
         return {"topic": topic, "level": level, "questions": [], "error": str(e), "sources": labs}
     items = _parse(raw)
     valid = [v for v in (_valid(q, labs) for q in items) if v]
+    if os.environ.get("MCQ_SHUFFLE", "1").strip().lower() not in ("0", "false", "no", "off"):
+        import random
+
+        rng = random.Random()
+        valid = [_shuffle_options(q, rng) for q in valid]
     return {
         "topic": topic,
         "level": level,

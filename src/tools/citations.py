@@ -30,11 +30,15 @@ def source_label(c) -> str:
 
 
 def excerpts_block(chunks, max_chars: int = 900) -> str:
-    """Excerpts for the prompt, each headed by the label the model must cite."""
+    """Excerpts for the prompt, each headed by the label the model must cite. Sentences that try to
+    instruct the assistant (planted in an uploaded file) are removed first (security review 2026-11-10)."""
+    from src.safety.guard import neutralize_instructions
+
     parts = []
     for c in chunks:
         text = c.get("text") if isinstance(c, dict) else getattr(c, "text", "")
-        parts.append(f"{source_label(c)}\n{(text or '').strip()[:max_chars]}")
+        text, _ = neutralize_instructions((text or "").strip())
+        parts.append(f"{source_label(c)}\n{text[:max_chars]}")
     return "\n\n---\n\n".join(parts)
 
 

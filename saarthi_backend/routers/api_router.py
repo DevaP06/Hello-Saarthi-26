@@ -14,6 +14,8 @@ from saarthi_backend.routers.note_router import router as note_router
 from saarthi_backend.routers.notification_router import router as notification_router
 from saarthi_backend.routers.qa_review_router import router as qa_review_router
 from saarthi_backend.routers.quiz_router import router as quiz_router
+from saarthi_backend.routers.review_router import router as review_router
+from saarthi_backend.routers.saarthi_contract_router import router as saarthi_contract_router
 from saarthi_backend.routers.teacher_router import router as teacher_router
 from saarthi_backend.routers.study_guide_router import router as study_guide_router
 from saarthi_backend.routers.user_router import router as user_router
@@ -33,6 +35,8 @@ api_router.include_router(notification_router)
 api_router.include_router(data_router)
 api_router.include_router(teacher_router)
 api_router.include_router(study_guide_router)
+api_router.include_router(review_router)
+api_router.include_router(saarthi_contract_router)
 api_router.include_router(admin_router)
 api_router.include_router(qa_review_router)
 api_router.include_router(kb_router)

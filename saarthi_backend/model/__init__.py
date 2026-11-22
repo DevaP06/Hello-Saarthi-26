@@ -9,6 +9,7 @@ from .notification_model import Notification
 from .chat_model import Conversation, ChatMessage
 from .code_problem_model import CodeProblem, CodeSubmission
 from .study_guide_model import StudyGuide, StudyGuidePrompt
+from .review_model import AnswerReview
 from .qa_review_model import QAReviewAction
 
 __all__ = [
@@ -39,5 +40,6 @@ __all__ = [
     "Bookmark",
     "StudyGuide",
     "StudyGuidePrompt",
+    "AnswerReview",
     "QAReviewAction",
 ]

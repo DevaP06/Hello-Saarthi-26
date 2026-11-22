@@ -431,7 +431,44 @@ def fetch_youtube_transcript(url: str) -> str:
     return " ".join(s["text"] for s in fetch_youtube_transcript_segments(url))
 
 
-def _index_video_segments_sync(video_id: int, video_title: str, segs: list[dict]) -> bool:
+def _mirror_video_to_course(course_id: int | None, video_id: int, texts: list[str], metadatas: list[dict]) -> None:
+    """Course chat searches only the course index, so a course video's transcript windows are also
+    stored there (replacing that video's earlier windows). Before this, students could not ask
+    about lectures from course chat at all."""
+    if not course_id or not texts:
+        return
+    with _lock_for(f"course:{course_id}"):
+        try:
+            _upsert_index(_KB_ROOT / str(course_id) / "vector_store", texts, metadatas, drop_where=("video_id", video_id))
+            _invalidate_cached_answers(course_id=course_id)
+            logger.info("Added %d transcript windows of video %s to course %s", len(texts), video_id, course_id)
+        except Exception as e:
+            logger.error("Could not add video %s to course %s index: %s", video_id, course_id, e)
+
+
+def _remove_video_from_course(course_id: int | None, video_id: int) -> None:
+    if not course_id:
+        return
+    with _lock_for(f"course:{course_id}"):
+        try:
+            from langchain_community.vectorstores import FAISS
+            from src.utils.llm import embeddings as make_embeddings
+
+            index_path = _KB_ROOT / str(course_id) / "vector_store"
+            if not (index_path / "index.faiss").exists():
+                return
+            vs = FAISS.load_local(str(index_path), make_embeddings(), allow_dangerous_deserialization=True)
+            stale = [i for i, d in vs.docstore._dict.items() if d.metadata.get("video_id") == video_id]
+            if stale:
+                vs.delete(stale)
+                vs.save_local(str(index_path))
+                _invalidate_cached_answers(course_id=course_id)
+                logger.info("Removed %d windows of video %s from course %s", len(stale), video_id, course_id)
+        except Exception as e:
+            logger.warning("Could not remove video %s from course %s index: %s", video_id, course_id, e)
+
+
+def _index_video_segments_sync(video_id: int, video_title: str, segs: list[dict], course_id: int | None = None) -> bool:
     """Blocking: group transcript segments into ~45s windows (start_sec/end_sec kept
     in metadata for citations) and store them in the per-video FAISS index."""
     texts: list[str] = []
@@ -480,13 +517,15 @@ def _index_video_segments_sync(video_id: int, video_title: str, segs: list[dict]
             _upsert_index(index_path, texts, metadatas)
             logger.info("Indexed %d transcript windows for video %d ('%s')", len(texts), video_id, video_title)
             _invalidate_cached_answers(video_id=video_id)
-            return True
         except Exception as e:
             logger.error("FAISS transcript indexing failed for video %d: %s", video_id, e)
             return False
+    _mirror_video_to_course(course_id, video_id, texts, metadatas)
+    return True
 
 
-def auto_index_youtube_video(video_id: int, video_title: str, url: str, embed_url: str | None = None) -> None:
+def auto_index_youtube_video(video_id: int, video_title: str, url: str, embed_url: str | None = None,
+                             course_id: int | None = None) -> None:
     """
     Fire-and-forget: if the video is a YouTube video and has no index yet,
     fetch its transcript and index it automatically.
@@ -503,7 +542,7 @@ def auto_index_youtube_video(video_id: int, video_title: str, url: str, embed_ur
         segs = fetch_youtube_transcript_segments(yt_url) or fetch_youtube_transcript_segments(url)
         if segs:
             logger.info("Auto-fetched YouTube transcript for video %d (%d segs)", video_id, len(segs))
-            _index_video_segments_sync(video_id, video_title, segs)
+            _index_video_segments_sync(video_id, video_title, segs, course_id=course_id)
         else:
             logger.info("No YouTube transcript available for video %d", video_id)
 
@@ -511,7 +550,8 @@ def auto_index_youtube_video(video_id: int, video_title: str, url: str, embed_ur
     t.start()
 
 
-def _index_video_transcript_sync(video_id: int, video_title: str, transcript_text: str) -> bool:
+def _index_video_transcript_sync(video_id: int, video_title: str, transcript_text: str,
+                                 course_id: int | None = None) -> bool:
     """Blocking: chunk, embed, and store a pasted transcript into the per-video FAISS index."""
     if not transcript_text or len(transcript_text.strip()) < 50:
         logger.info("Transcript too short to index for video %d", video_id)
@@ -532,17 +572,19 @@ def _index_video_transcript_sync(video_id: int, video_title: str, transcript_tex
             _upsert_index(index_path, chunks, metadatas)
             logger.info("Indexed %d transcript chunks for video %d ('%s')", len(chunks), video_id, video_title)
             _invalidate_cached_answers(video_id=video_id)
-            return True
         except Exception as e:
             logger.error("FAISS transcript indexing failed for video %d: %s", video_id, e)
             return False
+    _mirror_video_to_course(course_id, video_id, chunks, metadatas)
+    return True
 
 
-def index_video_transcript_background(video_id: int, video_title: str, transcript_text: str) -> None:
+def index_video_transcript_background(video_id: int, video_title: str, transcript_text: str,
+                                      course_id: int | None = None) -> None:
     """Fire-and-forget: index a video transcript in a background thread."""
     def _run():
         logger.info("Background transcript indexing started for video %d", video_id)
-        ok = _index_video_transcript_sync(video_id, video_title, transcript_text)
+        ok = _index_video_transcript_sync(video_id, video_title, transcript_text, course_id=course_id)
         if ok:
             logger.info("Transcript indexing complete for video %d", video_id)
         else:
@@ -571,13 +613,38 @@ def fetch_video_transcript_context(query: str, video_id: int, video_title: str, 
         return ""
 
 
-def delete_video_transcript_index(video_id: int) -> None:
-    """Remove the per-video FAISS index when a video is deleted."""
+def delete_video_transcript_index(video_id: int, course_id: int | None = None) -> None:
+    """Remove the per-video FAISS index (and the video's windows in its course index) when a video is deleted."""
     import shutil
+    _remove_video_from_course(course_id, video_id)
     index_path = _VIDEO_KB_ROOT / str(video_id)
     if index_path.exists():
         shutil.rmtree(str(index_path), ignore_errors=True)
         logger.info("Deleted transcript index for video %d", video_id)
+
+
+def index_instructor_correction(course_id: int, review_id: int, question: str, correction: str) -> bool:
+    """Blocking. Store an instructor's corrected answer as a chunk of the course index so the
+    next student who asks (and every similar question) is answered from it, citation
+    "[Instructor correction]". Re-saving a correction replaces the earlier chunk."""
+    text = f"Question: {question.strip()}\nInstructor's answer: {correction.strip()}"
+    md = chunk_metadata(
+        "course_material", text,
+        source="instructor_correction",
+        material_title="Instructor correction",
+        course_id=course_id,
+        chunk_index=0,
+    )
+    md["review_id"] = review_id
+    with _lock_for(f"course:{course_id}"):
+        try:
+            _upsert_index(_KB_ROOT / str(course_id) / "vector_store", [text], [md], drop_where=("review_id", review_id))
+            _invalidate_cached_answers(course_id=course_id)
+            logger.info("Indexed instructor correction %d for course %d", review_id, course_id)
+            return True
+        except Exception as e:
+            logger.error("Instructor correction %d not indexed: %s", review_id, e)
+            return False
 
 
 def delete_material_from_index(

@@ -11,6 +11,7 @@ from saarthi_backend.deps import get_current_user, get_db, get_pagination
 from saarthi_backend.model import User
 from saarthi_backend.schema.chat_schemas import (
     AnswerFeedbackRequest,
+    AnswerFeedbackResponse,
     ChatMessageRequest,
     ChatMessageResponse,
     ChatMessageResponseItem,
@@ -36,6 +37,7 @@ from saarthi_backend.schema.chat_schemas import (
 )
 from saarthi_backend.schema.common_schemas import PaginatedResponse, PaginationParams
 from saarthi_backend.service import chat_service
+from saarthi_backend.service.access_scope import retrieval_scope, retrieval_scope_optional
 from saarthi_backend.utils.exceptions import NotFoundError
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -47,6 +49,10 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 # marker the tutor is explicitly instructed to use).
 _SSE_DONE = "data: [DONE]\n\n"
 _SSE_ERROR_PREFIX = "data: [ERROR]"
+
+
+def _names(user: User) -> list[str]:
+    return [user.full_name] if user.full_name else []
 
 
 def _is_content_frame(chunk: str) -> bool:
@@ -80,7 +86,10 @@ def _message_to_item(m) -> ChatMessageResponseItem:
 
 # ─── Stateless (AIChatbot widget) ────────────────────────────────────────────
 @router.post("/message", response_model=ChatMessageResponse)
-async def chat_message(body: ChatMessageRequest):
+async def chat_message(
+    body: ChatMessageRequest,
+    _scope: Annotated[set[int] | None, Depends(retrieval_scope_optional)],
+):
     """Stateless chat (AIChatbot, material viewer). No persistence."""
     history = [{"role": m.role, "content": m.content} for m in body.conversationHistory]
     answer = await chat_service.stateless_message(
@@ -111,6 +120,7 @@ def _retrieval_query(question: str, history: list[dict], policy) -> str:
 async def stream_message(
     request: Request,
     body: StreamMessageRequest,
+    scope: Annotated[set[int] | None, Depends(retrieval_scope)],
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
@@ -136,7 +146,8 @@ async def stream_message(
     from src.orchestrator.topics import topic_of
     from src.safety.guard import check_injection, scrub_pii
     from src.telemetry.traces import hash_user, summarize_usage, write_trace
-    from src.tools.grounding import ground
+    from src.tools.grounding import ground, ground_multi
+    from src.tools.retrieve import allowed_courses
     from src.utils import budget
     from src.utils.llm import chat_model_name, reset_tier, set_tier
 
@@ -181,6 +192,7 @@ async def stream_message(
     system_extra = policy.socratic.system_instructions()
     meta_extra = {
         "tier": policy.tier,
+        "requested_tier": policy.decision.tier,  # 1 simple / 2 complex, before budget or a missing Tier 2
         "socratic": policy.socratic.stage,
         "cached": False,
         "classifier": policy.decision.source,
@@ -198,6 +210,7 @@ async def stream_message(
         started = _time.perf_counter()
         usage_token = budget.request_usage.set([])
         tier_token = set_tier(policy.tier or 1)
+        allowed_courses.set(scope)  # the response generator runs outside the dependency's context
         from saarthi_backend.ai.adapter import _sse_status
 
         try:
@@ -222,8 +235,9 @@ async def stream_message(
                 # Follow-ups ("I'm stuck", "explain more") carry no course terms of their own:
                 # retrieve for the problem / previous question they refer to.
                 retrieval_query = _retrieval_query(question, raw_history, policy)
-                grounding = await run_in_threadpool(
-                    lambda: ground(
+                ground_fn = ground_multi if body.planning else ground
+                result = await run_in_threadpool(
+                    lambda: ground_fn(
                         retrieval_query,
                         course_id=body.courseId,
                         material_title=body.contextMaterialTitle,
@@ -232,9 +246,11 @@ async def stream_message(
                         boost_terms=weak_topics,
                     )
                 )
+                grounding, plan_steps = result if body.planning else (result, None)
                 stream = stream_scoped_answer(
                     question, grounding, history, kind=policy.qclass.kind, tier=policy.tier,
                     system_extra=system_extra, course_name=course_name, meta_extra=meta_extra, sink=sink,
+                    steps=plan_steps, concise=policy.decision.tier == 1,
                 )
             else:
                 stream = run_chat_stream(
@@ -313,6 +329,27 @@ async def stream_message(
                 import logging
                 logging.getLogger(__name__).debug("cache/trace write skipped: %s", e)
 
+        # Instructor review queue: a course answer that ended "low" confidence (not covered,
+        # uncited, critic FAIL) is flagged so the instructor can write the right answer.
+        try:
+            if (body.courseId and sink.get("confidence") == "low" and cache_hit is None
+                    and policy.qclass.kind != "smalltalk" and not injection and assistant_content
+                    and await course_service.get_enrollment(db, user.id, body.courseId)):
+                from saarthi_backend.service.review_service import record_review
+                await record_review(
+                    db, course_id=body.courseId, user_id=user.id, query=question, answer=assistant_content,
+                    reply_mode=sink.get("reply_mode"), confidence="low",
+                    reasons=sink.get("confidence_reasons"), source="low_confidence",
+                )
+                await db.commit()
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug("review flag skipped: %s", e)
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
         # Persist to DB after streaming completes, then trigger lazy summarization
         try:
             if conv_id_int:
@@ -350,11 +387,12 @@ async def stream_message(
 @router.post("/study-plan", response_model=StudyPlanResponse)
 async def generate_study_plan(
     body: StudyPlanRequest,
+    _scope: Annotated[set[int] | None, Depends(retrieval_scope)],
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Generate a personalized weekly study plan based on enrollments, deadlines, and quiz scores."""
-    plan = await chat_service.generate_study_plan(db, user.id, body)
+    plan = await chat_service.generate_study_plan(db, user.id, body, student_names=_names(user))
     return plan
 
 
@@ -433,6 +471,7 @@ async def delete_conversation(
 async def send_message(
     conversation_id: int,
     body: SendMessageRequest,
+    _scope: Annotated[set[int] | None, Depends(retrieval_scope)],
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
@@ -456,10 +495,11 @@ async def send_message(
 @router.post("/socratic", response_model=SocraticChallengeResponse)
 async def socratic_challenge(
     body: SocraticChallengeRequest,
+    _scope: Annotated[set[int] | None, Depends(retrieval_scope)],
     user: Annotated[User, Depends(get_current_user)],
 ):
     """AI challenges the student's claim using the Socratic method to force active recall."""
-    return await chat_service.socratic_challenge(body)
+    return await chat_service.socratic_challenge(body, student_names=_names(user))
 
 
 # ─── Concept Graph ─────────────────────────────────────────────────────────────
@@ -471,6 +511,7 @@ class ConceptGraphRequest(StudyPlanRequest):
 @router.post("/concept-graph", response_model=ConceptGraphResponse)
 async def concept_graph(
     body: ConceptGraphRequest,
+    _scope: Annotated[set[int] | None, Depends(retrieval_scope)],
     user: Annotated[User, Depends(get_current_user)],
 ):
     """Generate a concept dependency graph with mastery levels for a course."""
@@ -482,6 +523,7 @@ async def concept_graph(
 @router.post("/exam-prediction", response_model=ExamPredictionResponse)
 async def exam_prediction(
     body: ExamPredictionRequest,
+    _scope: Annotated[set[int] | None, Depends(retrieval_scope)],
     user: Annotated[User, Depends(get_current_user)],
 ):
     """Predict likely exam topics and student readiness for each."""
@@ -502,11 +544,12 @@ async def list_flashcards(
 @router.post("/flashcards/generate", response_model=FlashcardDeckResponse)
 async def generate_flashcards(
     body: FlashcardDeckRequest,
+    _scope: Annotated[set[int] | None, Depends(retrieval_scope)],
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Extract Anki-style flashcards and append them to the user's library."""
-    return await chat_service.generate_flashcards(body, db=db, user_id=user.id)
+    return await chat_service.generate_flashcards(body, db=db, user_id=user.id, student_names=_names(user))
 
 
 @router.post("/flashcards/review", response_model=FlashcardReviewResponse)
@@ -520,14 +563,14 @@ async def review_flashcard(
 
 
 # ─── Answer feedback (thumbs up / down) ──────────────────────────────────────
-@router.post("/feedback")
+@router.post("/feedback", response_model=AnswerFeedbackResponse)
 async def answer_feedback(
     body: AnswerFeedbackRequest,
     user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Record a rating for the researcher dashboard (traces) and, on thumbs-down,
     evict the answer from the semantic cache so it is never served again (WBS 3.4.4)."""
-    from saarthi_backend.schema.chat_schemas import AnswerFeedbackResponse
     from src.cache.semantic_cache import build_scope, get_cache
     from src.safety.guard import scrub_pii
     from src.telemetry.traces import hash_user, write_trace
@@ -539,6 +582,16 @@ async def answer_feedback(
         scope = build_scope(course_id=body.courseId, material_title=body.contextMaterialTitle,
                             video_id=body.contextVideoId, mode="chat")
         evicted = await run_in_threadpool(lambda: get_cache().forget(scope, query, body.cacheEntryId))
+        from saarthi_backend.service import course_service
+        if body.courseId and await course_service.get_enrollment(db, user.id, body.courseId):
+            from saarthi_backend.service.review_service import record_review
+            answer_text = scrub_pii(body.answer or "", [user.full_name] if user.full_name else [])[0]
+            await record_review(
+                db, course_id=body.courseId, user_id=user.id, query=query, answer=answer_text,
+                reply_mode=None, confidence=None, reasons=[comment] if comment else ["student rated this answer down"],
+                source="thumbs_down",
+            )
+            await db.commit()
     write_trace({
         "type": "feedback",
         "user": hash_user(user.id),

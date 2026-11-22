@@ -11,7 +11,7 @@ interface KBSource {
     page?: number | string | null;
     topic?: string | null;
     sourceType?: string | null;
-    score: number;
+    score?: number | null;
     text: string;
 }
 
@@ -68,7 +68,7 @@ export default function AskNotesPage() {
             <div className="an-header">
                 <h1><BookOpenCheck size={22} /> Ask the Notes</h1>
                 <p>
-                    Answers come only from the course knowledge base{ready?.ready ? ` (${ready.chunks} sections of lecture notes)` : ''},
+                    Answers come only from the course knowledge base{ready?.ready && ready.chunks > 0 ? ` (${ready.chunks} sections of lecture notes)` : ''},
                     with the source of each fact.
                 </p>
                 {ready && !ready.ready && <p className="an-error">{ready.message}</p>}
@@ -115,8 +115,8 @@ export default function AskNotesPage() {
                                     onClick={() => setOpenSource(openSource === s.n ? null : s.n)}
                                 >
                                     <span className="an-source-n">[{s.n}]</span>
-                                    <span className="an-source-file">{shortName(s.sourceFile)}{s.page ? `, page ${s.page}` : ''}</span>
-                                    <span className="an-source-score" title="How closely this section matches your question">{Math.round(s.score * 100)}% match</span>
+                                    <span className="an-source-file">{shortName(s.sourceFile)}{s.page ? (s.sourceType === 'video' ? `, ${s.page}` : `, page ${s.page}`) : ''}</span>
+                                    {typeof s.score === 'number' && <span className="an-source-score" title="How closely this section matches your question">{Math.round(s.score * 100)}% match</span>}
                                     {openSource === s.n ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
                                 </button>
                                 {openSource === s.n && <pre className="an-source-text">{s.text}</pre>}

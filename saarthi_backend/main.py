@@ -61,6 +61,7 @@ from saarthi_backend.utils.exceptions import (
 )
 from saarthi_backend.utils.logging import get_logger
 from saarthi_backend.utils.rate_limit import (
+    RATE_LIMIT_ANON_CHAT,
     RATE_LIMIT_AUTH,
     RATE_LIMIT_GENERAL,
     RATE_LIMIT_MATERIAL_FILE,
@@ -96,6 +97,8 @@ def _validate_settings_at_startup() -> None:
 
 
 def _load_ddl(filename: str) -> list[str]:
+    """Idempotent (CREATE ... IF NOT EXISTS) migration statements, also applied at startup so a restart
+    is enough on databases where the migration runner was never run."""
     sql = (_backend_dir / "migrations" / filename).read_text(encoding="utf-8")
     body = "\n".join(line for line in sql.splitlines() if not line.strip().startswith("--"))
     return [s.strip() for s in body.split(";") if s.strip()]
@@ -106,16 +109,10 @@ def _load_classroom_invites_ddl() -> list[str]:
 
 
 _CLASSROOM_INVITES_DDL = _load_classroom_invites_ddl()
+# 008 = class invites, 012 = AI answer review queue (AI team; was 009 before the merge with main)
+_STARTUP_DDL = _CLASSROOM_INVITES_DDL + _load_ddl("012_answer_reviews.sql")
 _MODULES_QUIZZES_CODE_DDL = _load_ddl("011_modules_quizzes_code.sql")
-
-
-def _load_qa_review_actions_ddl() -> list[str]:
-    sql = (_backend_dir / "migrations" / "009_qa_review_actions.sql").read_text(encoding="utf-8")
-    body = "\n".join(line for line in sql.splitlines() if not line.strip().startswith("--"))
-    return [s.strip() for s in body.split(";") if s.strip()]
-
-
-_QA_REVIEW_ACTIONS_DDL = _load_qa_review_actions_ddl()
+_QA_REVIEW_ACTIONS_DDL = _load_ddl("009_qa_review_actions.sql")
 
 
 @asynccontextmanager
@@ -162,7 +159,7 @@ async def lifespan(app: FastAPI):
             )
         """))
         # Invites / class codes had an ORM model but no migration (see 008_classroom_invites.sql).
-        for stmt in _CLASSROOM_INVITES_DDL:
+        for stmt in _STARTUP_DDL:
             await conn.execute(text(stmt))
         # Manual QA review audit log (see 009_qa_review_actions.sql).
         for stmt in _QA_REVIEW_ACTIONS_DDL:
@@ -174,7 +171,7 @@ async def lifespan(app: FastAPI):
             await conn.execute(text(stmt))
     logger.info("Column migration: saarthi_videos.transcript_text ensured")
     logger.info("Table migration: saarthi_code_problems ensured")
-    logger.info("Table migration: saarthi_classroom_invites ensured")
+    logger.info("Table migration: saarthi_classroom_invites + saarthi_answer_reviews ensured")
     logger.info("Table migration: saarthi_qa_review_actions ensured")
     session_factory = async_sessionmaker(
         engine,
@@ -218,6 +215,10 @@ async def lifespan(app: FastAPI):
         logger.info("YouTube auto-index scheduled for %d existing videos", len(all_videos))
     except Exception as _yt_err:
         logger.warning("YouTube auto-index startup skipped: %s", _yt_err)
+
+    # Load models and course indexes now, so the first students do not pay for it (AI_WARMUP=0 skips).
+    from src.utils.warmup import start_background_warmup
+    start_background_warmup()
 
     logger.info("Saarthi backend started: PostgreSQL ready, AI in-process (src/ graph)")
     yield
@@ -276,6 +277,11 @@ async def rate_limit_middleware(request: Request, call_next):
     elif path == "/api/courses/upload" and request.method == "POST":
         limit, window = RATE_LIMIT_UPLOAD
         prefix = "upload"
+    elif path == "/api/chat/message" and request.method == "POST" and not (
+        request.headers.get("Authorization") or request.cookies
+    ):
+        limit, window = RATE_LIMIT_ANON_CHAT
+        prefix = "anon_chat"
     elif "/materials/" in path and path.endswith("/file") and request.method == "GET":
         limit, window = RATE_LIMIT_MATERIAL_FILE
         prefix = "file"
