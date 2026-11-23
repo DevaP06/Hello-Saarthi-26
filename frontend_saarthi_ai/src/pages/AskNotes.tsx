@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
-import { BookOpenCheck, ChevronDown, ChevronUp, Loader2, Send } from 'lucide-react';
+import { BookOpenCheck, ChevronDown, ChevronUp, ExternalLink, Loader2, Send } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import { usePageTitle } from '../lib/usePageTitle';
 import { renderAnswer } from '../lib/renderAnswer';
+import { resourceLink } from '../lib/resourceLinks';
 import './AskNotes.css';
 
 interface KBSource {
@@ -12,6 +14,10 @@ interface KBSource {
     topic?: string | null;
     sourceType?: string | null;
     score?: number | null;
+    courseId?: number | null;
+    materialId?: number | null;
+    videoId?: number | null;
+    startSeconds?: number | null;
     text: string;
 }
 
@@ -106,9 +112,11 @@ export default function AskNotesPage() {
 
                     <h3 className="an-sources-title">Sources from the notes</h3>
                     <ol className="an-sources">
-                        {result.sources.map((s) => (
-                            <li key={s.n} className="an-source">
-                                <button
+                        {result.sources.map((s) => {
+                            const link = resourceLink(s);
+                            return <li key={s.n} className="an-source">
+                                <div className="an-source-row">
+                                    <button
                                     type="button"
                                     className="an-source-head"
                                     aria-expanded={openSource === s.n}
@@ -118,10 +126,14 @@ export default function AskNotesPage() {
                                     <span className="an-source-file">{shortName(s.sourceFile)}{s.page ? (s.sourceType === 'video' ? `, ${s.page}` : `, page ${s.page}`) : ''}</span>
                                     {typeof s.score === 'number' && <span className="an-source-score" title="How closely this section matches your question">{Math.round(s.score * 100)}% match</span>}
                                     {openSource === s.n ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-                                </button>
+                                    </button>
+                                    {link && <Link to={link} target="_blank" rel="noopener noreferrer" className="btn btn-secondary btn-sm">
+                                        <ExternalLink size={14} /> Open source
+                                    </Link>}
+                                </div>
                                 {openSource === s.n && <pre className="an-source-text">{s.text}</pre>}
-                            </li>
-                        ))}
+                            </li>;
+                        })}
                     </ol>
                 </div>
             )}

@@ -111,12 +111,15 @@ NOTES = ("The Nyquist rate is twice the highest frequency present in a band-limi
 
 
 def test_retrieve_returns_course_chunks_with_citable_fields(sandbox):
+    from saarthi_backend.ai.adapter import citations_from_chunks
     from src.tools.retrieve import retrieve
 
-    index_text(1, "Sampling", NOTES)
+    index_text(1, "Sampling", NOTES, material_id=7)
     chunks = retrieve("What is the Nyquist rate", course_id=1, k=3)
     assert chunks and all("Nyquist" in c.text for c in chunks)
     assert chunks[0].title == "Sampling" and chunks[0].course_id == 1
+    source = citations_from_chunks(chunks)[0]
+    assert source["course_id"] == 1 and source["material_id"] == 7
 
 
 def test_course_scope_never_leaks_another_course(sandbox):

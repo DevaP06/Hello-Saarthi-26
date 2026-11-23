@@ -2,7 +2,32 @@
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+class HighlightRectangle(BaseModel):
+    x: float = Field(ge=0, lt=1)
+    y: float = Field(ge=0, lt=1)
+    width: float = Field(gt=0, le=1)
+    height: float = Field(gt=0, le=1)
+
+    @model_validator(mode="after")
+    def within_page(self):
+        if self.x + self.width > 1.000001 or self.y + self.height > 1.000001:
+            raise ValueError("Highlight rectangles must fit inside the page.")
+        return self
+
+
+class MaterialAnnotationCreate(BaseModel):
+    documentVersion: str = Field(pattern=r"^[a-f0-9]{64}$")
+    page: int = Field(gt=0, le=100000)
+    quote: str = Field(min_length=1, max_length=5000)
+    note: str = Field(default="", max_length=4000)
+    rectangles: list[HighlightRectangle] = Field(min_length=1, max_length=100)
+
+
+class MaterialAnnotationResponse(MaterialAnnotationCreate):
+    id: str
 
 
 # ----- Course -----
@@ -14,6 +39,8 @@ class CourseResponse(BaseModel):
     description: Optional[str] = None
     thumbnailEmoji: Optional[str] = None
     color: Optional[str] = None
+    archivedAt: str | None = None
+    syllabusName: str | None = None
 
     class Config:
         populate_by_name = True
@@ -35,6 +62,10 @@ class CourseUpdate(BaseModel):
     description: Optional[str] = None
     thumbnailEmoji: Optional[str] = None
     color: Optional[str] = None
+
+
+class CourseArchiveUpdate(BaseModel):
+    archived: bool
 
 
 # ----- Enrollment -----
@@ -242,6 +273,7 @@ class SearchItem(BaseModel):
     title: str
     subtitle: Optional[str] = None
     link: str
+    courseId: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -262,6 +294,7 @@ class ModuleResponse(BaseModel):
     courseId: str
     title: str
     sortOrder: int
+    prerequisiteIds: list[str] = Field(default_factory=list)
 
 
 class ModuleCreate(BaseModel):
@@ -271,6 +304,11 @@ class ModuleCreate(BaseModel):
 class ModuleUpdate(BaseModel):
     title: Optional[str] = Field(None, min_length=1, max_length=128)
     sortOrder: Optional[int] = None
+    prerequisiteIds: list[int] | None = Field(default=None, max_length=100)
+
+
+class ModuleOrderUpdate(BaseModel):
+    moduleIds: list[int] = Field(min_length=1)
 
 
 class BookmarkResponse(BaseModel):

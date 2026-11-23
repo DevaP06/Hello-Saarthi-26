@@ -179,7 +179,8 @@ async def seed_code_problems(db: AsyncSession) -> None:
         await _add_test_cases(db)
         # Existing laptops already have the numpy Butterworth starter — rewrite it
         # so Run no longer dies with ModuleNotFoundError.
-        rows = (await db.execute(select(CodeProblem))).scalars().all()
+        # Only the seeded practice problems: a teacher's course problem may share a title.
+        rows = (await db.execute(select(CodeProblem).where(CodeProblem.course_id.is_(None)))).scalars().all()
         changed = False
         for row in rows:
             raw = row.starter_code_json or ""
@@ -218,7 +219,7 @@ async def _add_test_cases(db: AsyncSession) -> None:
     The first seed had wrong expected outputs for the Butterworth and regression
     problems; those are replaced too. Problems a teacher already gave test cases keep them.
     """
-    rows = (await db.execute(select(CodeProblem))).scalars().all()
+    rows = (await db.execute(select(CodeProblem).where(CodeProblem.course_id.is_(None)))).scalars().all()
     changed = False
     for row in rows:
         fresh = next((p for p in _PROBLEMS if p["title"] == row.title), None)

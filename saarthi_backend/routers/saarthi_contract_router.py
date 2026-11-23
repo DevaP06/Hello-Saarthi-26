@@ -16,13 +16,14 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from saarthi_backend.dao import ConversationDAO
 from saarthi_backend.deps import get_current_user, get_db
-from saarthi_backend.model import Course, User
+from saarthi_backend.model import Course, Material, User
 from saarthi_backend.service import course_service
+from saarthi_backend.service.access_scope import allowed_course_ids
 from saarthi_backend.utils.exceptions import ForbiddenError, NotFoundError, ValidationError
 
 router = APIRouter(prefix="/v1/saarthi", tags=["saarthi-contract"])
@@ -30,9 +31,8 @@ router = APIRouter(prefix="/v1/saarthi", tags=["saarthi-contract"])
 _MAX_TOP_K = 20
 _MAX_SUMMARY_CHARS = 4000
 _MAX_METADATA_BYTES = 8000
-# Contract content types -> what src.tools.retrieve indexes. Code / exercise corpora are not ingested yet.
 _SHARED_TYPES = {"notes": "notes", "books": "books", "video": "video"}
-_NOT_INDEXED = {"code", "exercises", "exercise"}
+_COURSE_TYPES = {"code", "exercises", "exercise"}
 
 
 class SearchRequest(BaseModel):
@@ -42,6 +42,7 @@ class SearchRequest(BaseModel):
     include_scores: bool = True
     course_id: int | None = Field(None, description="Search this course's materials (enrolled students, owner, admin).")
     video_id: int | None = Field(None, description="Search one video's transcript.")
+    include_courses: bool = Field(False, description="Include all course indexes the caller can access.")
 
 
 class SearchChunk(BaseModel):
@@ -92,47 +93,72 @@ async def retrieval_search(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Ranked chunks for a query, same hybrid retrieval the chat uses."""
-    from src.tools.retrieve import retrieve
+    from src.tools.retrieve import allowed_courses, retrieve
 
     requested = [t.lower() for t in (body.content_types or [])]
-    unknown = [t for t in requested if t not in _SHARED_TYPES and t not in _NOT_INDEXED]
+    unknown = [t for t in requested if t not in _SHARED_TYPES and t not in _COURSE_TYPES]
     if unknown:
         raise ValidationError(f"Unknown content type(s): {', '.join(unknown)}. Use notes, video, code or exercises.", details=None)
 
     if body.course_id is not None:
         await _require_course_access(db, user, body.course_id)
-    elif body.video_id is not None:
+    if body.video_id is not None:
         video = await _get_video(db, body.video_id)
-        if video is not None and video.course_id is not None:
+        if video is None or (body.course_id is not None and body.course_id != video.course_id):
+            raise NotFoundError("Video not found.", details=None)
+        if video.course_id is not None:
             await _require_course_access(db, user, video.course_id)
 
+    search_course_indexes = body.include_courses or body.course_id is not None or body.video_id is not None
     shared = [_SHARED_TYPES[t] for t in requested if t in _SHARED_TYPES]
-    if requested and not shared and body.course_id is None and body.video_id is None:
+    if requested and not shared and not search_course_indexes:
         return SearchResponse(results=[], query=body.query, total_returned=0)  # only code/exercises asked for
     top_k = min(body.top_k, _MAX_TOP_K)
-    chunks = await run_in_threadpool(
-        lambda: retrieve(
-            body.query,
-            # Unscoped = the shared knowledge base only, never other courses' private materials.
-            content_types=None if (body.course_id or body.video_id) else (shared or ["notes", "books", "video"]),
-            course_id=body.course_id,
-            video_id=body.video_id,
-            k=top_k,
+    scope = await allowed_course_ids(db, user) if search_course_indexes else set()
+    token = allowed_courses.set(scope)
+    try:
+        chunks = await run_in_threadpool(
+            lambda: retrieve(
+                body.query,
+                content_types=None if search_course_indexes else (shared or ["notes", "books", "video"]),
+                course_id=body.course_id,
+                video_id=body.video_id,
+                k=top_k * 4 if search_course_indexes and requested else top_k,
+            )
         )
-    )
+    finally:
+        allowed_courses.reset(token)
+
+    ids = {c.material_id for c in chunks if c.material_id}
+    materials = {m.id: m for m in (await db.scalars(select(Material).where(Material.id.in_(ids))))} if ids else {}
+    tags = {_contract_type(t) for t in requested if t != "exercises"}
+    if "exercises" in requested:
+        tags.add("exercise")
     results = []
-    for c in chunks[:top_k]:
+    for c in chunks:
+        if scope is not None and c.course_id is not None and c.course_id not in scope:
+            continue
+        material = materials.get(c.material_id)
+        content_type = _contract_type(c.content_type)
+        if material and material.course_id == c.course_id and material.type in ("exercise", "code"):
+            content_type = material.type
+        if c.video_id is not None or c.start_sec is not None:
+            content_type = "video"
+        if tags and search_course_indexes and content_type not in tags:
+            continue
         results.append(SearchChunk(
-            content_type=_contract_type(c.content_type),
+            content_type=content_type,
             source_id=str(c.id or ""),
             text=c.text,
             score=round(float(c.score), 4) if (body.include_scores and c.score is not None) else None,
             metadata={k: v for k, v in {
                 "title": c.title, "source_file": c.source_file, "page": c.page,
                 "start_sec": c.start_sec, "end_sec": c.end_sec,
-                "course_id": c.course_id, "video_id": c.video_id,
+                "course_id": c.course_id, "material_id": c.material_id, "video_id": c.video_id,
             }.items() if v is not None},
         ))
+        if len(results) >= top_k:
+            break
     return SearchResponse(results=results, query=body.query, total_returned=len(results))
 
 

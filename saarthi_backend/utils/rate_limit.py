@@ -1,8 +1,15 @@
 """In-memory rate limiting (production: use Redis or similar)."""
 
+import hmac
+import os
 import time
-from collections import defaultdict
 from typing import Tuple
+
+# Production: Caddy, the only real proxy, sends this secret with every request
+# (deploy/Caddyfile). Other callers on the internal network, such as code running in
+# the sandbox, cannot forge it, so their X-Forwarded-For is ignored and they cannot
+# dodge the per-IP limits (e.g. on login). Unset (local dev): the header is trusted.
+_PROXY_SECRET = os.environ.get("PROXY_SECRET", "")
 
 # Key -> (count, window_start_ts)
 _buckets: dict[str, Tuple[int, float]] = {}
@@ -47,9 +54,12 @@ def check_rate_limit(identifier: str, prefix: str, limit: int, window_sec: int) 
 
 
 def get_identifier_from_request(request) -> str:
-    """Client IP; prefer X-Forwarded-For when behind a proxy (use leftmost if trusted)."""
+    """Client IP: X-Forwarded-For when it comes from our own proxy, else the connecting peer."""
     forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
+    from_proxy = not _PROXY_SECRET or hmac.compare_digest(
+        request.headers.get("x-saarthi-proxy", "").encode(), _PROXY_SECRET.encode()
+    )
+    if forwarded and from_proxy:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 

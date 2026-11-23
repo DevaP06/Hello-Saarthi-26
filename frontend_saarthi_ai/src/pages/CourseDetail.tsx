@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { lazy, Suspense, useState, useEffect, useRef } from 'react';
+import { Link, useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import {
     ArrowLeft, Plus, FileText, Video, BookOpen, Trash2, X, Save, Paperclip,
     Link as LinkIcon, Heading, Pencil, ExternalLink, Send, Sparkles, Users,
@@ -10,6 +10,9 @@ import StreamComments from '../components/StreamComments';
 import AssignmentDialog from '../components/AssignmentDialog';
 import AuthImage from '../components/AuthImage';
 import QuizEditor from '../components/QuizEditor';
+import MaterialIndexBadge from '../components/MaterialIndexBadge';
+import CourseSyllabus from '../components/CourseSyllabus';
+import ModulePrerequisites from '../components/ModulePrerequisites';
 import { formatDue, isClosed, statusLabel, toDateTimeLocal } from '../lib/assignmentStatus';
 import { api, authFetch, getAllPages, uploadFile, getUploadFullUrl, getMaterialFileUrl, type CourseResponse, type PaginatedResponse, type AssignmentResponse, type MaterialResponse, type StreamItemResponse, type CoursePersonResponse, type VideoResponse, type ModuleResponse, type BookmarkResponse, type QuizResponse } from '../lib/api';
 import Pagination from '../components/Pagination';
@@ -18,7 +21,14 @@ import ConfirmModal from '../components/ConfirmModal';
 import EmptyState from '../components/EmptyState';
 import { useToast } from '../components/Toast';
 import AIReviewPanel from '../components/AIReviewPanel';
+import CourseQueryLog from '../components/CourseQueryLog';
+import AnswerSources from '../components/AnswerSources';
+import { useResourceActivity } from '../lib/useResourceActivity';
+import { streamChat } from '../lib/streamChat';
+import type { ChatAnswerMetadata, ConversationResponse } from '../lib/api';
 import './CourseDetail.css';
+
+const MaterialPdf = lazy(() => import('../components/MaterialPdf'));
 
 const PAGE_SIZE = 20;
 
@@ -73,7 +83,7 @@ interface StreamItem {
     attachments?: { name: string, url?: string, materialId?: string }[];
 }
 
-type DocChatMessage = { role: 'user' | 'assistant'; content: string };
+type DocChatMessage = { role: 'user' | 'assistant'; content: string; metadata?: ChatAnswerMetadata | null };
 
 /** AI answers can quote uploaded course text, so escape HTML before the light markdown below
  *  (security review S2: a poisoned file could otherwise run script in students' browsers). */
@@ -205,9 +215,11 @@ export default function CourseDetailPage() {
     const [course, setCourse] = useState<CourseResponse | null>(null);
     const [courseLoading, setCourseLoading] = useState(true);
     const [courseError, setCourseError] = useState<string | null>(null);
-    const [activeTab, setActiveTab] = useState('stream');
+    const [searchParams, setSearchParams] = useSearchParams();
+    const [activeTab, setActiveTab] = useState(() => searchParams.get('tab') === 'classwork' ? 'classwork' : 'stream');
     const [assignments, setAssignments] = useState<Assignment[]>([]);
     const [materials, setMaterials] = useState<Material[]>([]);
+    const [materialsLoadedFor, setMaterialsLoadedFor] = useState<string | null>(null);
     const [stream, setStream] = useState<StreamItem[]>([]);
     const [streamTotal, setStreamTotal] = useState(0);
     const [streamOffset, setStreamOffset] = useState(0);
@@ -218,7 +230,10 @@ export default function CourseDetailPage() {
     const [quizzes, setQuizzes] = useState<QuizResponse[]>([]);
     // Classwork topics (course modules), saved on the server in order.
     const [modules, setModules] = useState<ModuleResponse[]>([]);
+    const [editingPrerequisites, setEditingPrerequisites] = useState<{ courseId: string; moduleId: string } | null>(null);
+    const [reorderingModules, setReorderingModules] = useState(false);
     const topics = modules.map((m) => m.title);
+    const requiredTopics = new Set(modules.flatMap((module) => module.prerequisiteIds ?? []));
     const [bookmarks, setBookmarks] = useState<BookmarkResponse[]>([]);
     const [classworkFilter, setClassworkFilter] = useState<ClassworkFilter>('all');
     const [showQuizEditor, setShowQuizEditor] = useState(false);
@@ -253,7 +268,8 @@ export default function CourseDetailPage() {
         let cancelled = false;
         getAllPages<MaterialResponse>(`/courses/${courseId}/materials`)
             .then((items) => { if (!cancelled) setMaterials(items.map(mapMaterial)); })
-            .catch(() => { if (!cancelled) setMaterials([]); });
+            .catch(() => { if (!cancelled) setMaterials([]); })
+            .finally(() => { if (!cancelled) setMaterialsLoadedFor(courseId); });
         return () => { cancelled = true; };
     }, [courseId]);
 
@@ -324,7 +340,9 @@ export default function CourseDetailPage() {
         if (!window.confirm(`Delete the topic "${m.title}"? Its work stays in the course under "No topic".`)) return;
         try {
             await api.delete(`/courses/${courseId}/modules/${m.id}`);
-            setModules((prev) => prev.filter((x) => x.id !== m.id));
+            setModules((prev) => prev.filter((x) => x.id !== m.id).map((x) => ({
+                ...x, prerequisiteIds: (x.prerequisiteIds ?? []).filter((id) => id !== m.id),
+            })));
             retopicItems(m.title, 'No topic');
         } catch (e) {
             toast.showToast(e instanceof Error ? e.message : 'Could not delete topic', 'error');
@@ -334,16 +352,17 @@ export default function CourseDetailPage() {
     /** Swap a topic with its neighbour and save both positions. */
     const moveModule = async (index: number, delta: -1 | 1) => {
         const other = index + delta;
-        if (other < 0 || other >= modules.length) return;
+        if (other < 0 || other >= modules.length || reorderingModules) return;
         const next = [...modules];
         [next[index], next[other]] = [next[other], next[index]];
-        const ordered = next.map((m, i) => ({ ...m, sortOrder: i }));
-        setModules(ordered);
+        setReorderingModules(true);
         try {
-            await Promise.all([index, other].map((i) =>
-                api.patch(`/courses/${courseId}/modules/${ordered[i].id}`, { sortOrder: i })));
+            const ordered = await api.put<ModuleResponse[]>(`/courses/${courseId}/modules/order`, { moduleIds: next.map((module) => Number(module.id)) });
+            setModules(ordered);
         } catch (e) {
             toast.showToast(e instanceof Error ? e.message : 'Could not reorder topics', 'error');
+        } finally {
+            setReorderingModules(false);
         }
     };
 
@@ -376,7 +395,16 @@ export default function CourseDetailPage() {
     const [createMenuOpen, setCreateMenuOpen] = useState(false);
     const [openAssignmentId, setOpenAssignmentId] = useState<string | null>(null);
     const [showMyWork, setShowMyWork] = useState(false);
-    const [viewingMaterial, setViewingMaterial] = useState<Material | null>(null);
+    const requestedMaterial = searchParams.get('material');
+    const requestedPage = Number(searchParams.get('page'));
+    const viewingMaterial = materialsLoadedFor === courseId ? materials.find((item) => item.id === requestedMaterial) : null;
+    const setViewingMaterial = (item: Material | null) => {
+        const next = new URLSearchParams(searchParams);
+        next.delete('page');
+        if (item) next.set('material', item.id);
+        else next.delete('material');
+        setSearchParams(next, { replace: true });
+    };
     const [savingMaterial, setSavingMaterial] = useState(false);
     const [deletingMaterialId, setDeletingMaterialId] = useState<string | null>(null);
     const [materialToDelete, setMaterialToDelete] = useState<Material | null>(null);
@@ -385,9 +413,13 @@ export default function CourseDetailPage() {
     const [docChatFollowups, setDocChatFollowups] = useState<string[]>([]);
     const [docChatInput, setDocChatInput] = useState('');
     const [docChatSending, setDocChatSending] = useState(false);
+    const docChatSession = useRef({ conversationId: '' });
     const [docPdfObjectUrl, setDocPdfObjectUrl] = useState<string | null>(null);
+    const [docVersion, setDocVersion] = useState<string | null>(null);
     const [docPdfError, setDocPdfError] = useState<string | null>(null);
     const [docPdfLoading, setDocPdfLoading] = useState(false);
+    const pdfPageUrl = docPdfObjectUrl && Number.isSafeInteger(requestedPage) && requestedPage > 0
+        ? `${docPdfObjectUrl}#page=${requestedPage}` : docPdfObjectUrl;
 
     /** The backend posts to the stream when classwork is created; reload the stream to show it. */
     const refreshStream = async () => {
@@ -607,9 +639,12 @@ export default function CourseDetailPage() {
     };
 
     useEffect(() => {
+        docChatSession.current = { conversationId: '' };
         if (viewingMaterial) {
             setDocChatMessages([]);
             setDocChatInput('');
+            setDocChatFollowups([]);
+            setDocChatSending(false);
         }
     }, [viewingMaterial?.id]);
 
@@ -618,6 +653,10 @@ export default function CourseDetailPage() {
     // so the viewer decides by the downloaded file's real content type (docMime).
     const isUploadedMaterial = (m: Material) => /\/materials\/\d+\/file$/.test(m.url) || /\/uploads\//.test(m.url);
     const [docMime, setDocMime] = useState('');
+    useResourceActivity('material', viewingMaterial?.id, () => Boolean(
+        docPdfObjectUrl && !docPdfLoading && !docPdfError &&
+        (docMime === 'application/pdf' || docMime.startsWith('image/')),
+    ));
 
     useEffect(() => {
         if (!viewingMaterial || !courseId || !isUploadedMaterial(viewingMaterial)) {
@@ -629,6 +668,7 @@ export default function CourseDetailPage() {
             setDocPdfLoading(false);
             return;
         }
+        let cancelled = false;
         const url = getMaterialFileUrl(courseId, viewingMaterial.id);
         setDocPdfError(null);
         setDocPdfLoading(true);
@@ -641,20 +681,24 @@ export default function CourseDetailPage() {
             credentials: 'include',
             headers: base.includes('ngrok') ? { 'ngrok-skip-browser-warning': '1' } : {},
         })
-            .then((res) => {
+            .then(async (res) => {
                 if (!res.ok) throw new Error(res.status === 401 || res.status === 403 ? 'Please sign in again to view this file.' : `Could not load file (${res.status}).`);
-                return res.blob();
+                return { blob: await res.blob(), version: res.headers.get('X-Document-Version') };
             })
-            .then((blob) => {
+            .then(({ blob, version }) => {
+                if (cancelled) return;
                 setDocMime(blob.type);
+                setDocVersion(version);
                 setDocPdfObjectUrl(URL.createObjectURL(blob));
                 setDocPdfError(null);
             })
             .catch((e) => {
+                if (cancelled) return;
                 setDocPdfError(e instanceof Error ? e.message : 'Failed to load file.');
             })
-            .finally(() => setDocPdfLoading(false));
+            .finally(() => { if (!cancelled) setDocPdfLoading(false); });
         return () => {
+            cancelled = true;
             setDocPdfObjectUrl((prev) => {
                 if (prev) URL.revokeObjectURL(prev);
                 return null;
@@ -669,23 +713,42 @@ export default function CourseDetailPage() {
         setDocChatFollowups([]);
         setDocChatMessages((prev) => [...prev, { role: 'user', content: userContent }]);
         setDocChatSending(true);
+        const session = docChatSession.current;
         try {
-            const data = await api.post<{ response: string }>('/chat/message', {
-                message: userContent,
-                conversationHistory: docChatMessages,
-                contextMaterialTitle: viewingMaterial.title,
-                courseId: courseId ? parseInt(courseId) : undefined,
-            });
-            const raw = data.response || '';
+            let raw: string;
+            let metadata: ChatAnswerMetadata | null | undefined;
+            if (user?.role === 'student') {
+                if (!session.conversationId) {
+                    const conversation = await api.post<ConversationResponse>('/chat/conversations', {
+                        title: `Notes · ${viewingMaterial.title}`.slice(0, 255), courseId: Number(courseId),
+                    });
+                    session.conversationId = conversation.id;
+                }
+                const { assistantMessage } = await streamChat({
+                    conversationId: session.conversationId, message: userContent, courseId: Number(courseId),
+                    contextMaterialId: Number(viewingMaterial.id), answerMode: 'direct',
+                }, () => {}, () => {});
+                raw = assistantMessage.content;
+                metadata = assistantMessage.answerMetadata;
+            } else {
+                const data = await api.post<{ response: string }>('/chat/message', {
+                    message: userContent, conversationHistory: docChatMessages,
+                    contextMaterialTitle: viewingMaterial.title, courseId: Number(courseId),
+                });
+                raw = data.response || '';
+            }
+            if (docChatSession.current !== session) return;
             const followupMatch = raw.match(/FOLLOWUPS?:\s*(.+)$/im);
             const followups = followupMatch ? followupMatch[1].split('|').map((s: string) => s.trim()).filter(Boolean) : [];
             const clean = raw.replace(/CHECKPOINT\s*/gi, '').replace(/FOLLOWUPS?:.*$/im, '').trim();
             setDocChatFollowups(followups);
-            setDocChatMessages((prev: DocChatMessage[]) => [...prev, { role: 'assistant', content: clean }]);
+            setDocChatMessages((prev) => [...prev, { role: 'assistant', content: clean, metadata }]);
         } catch (e) {
-            setDocChatMessages((prev: DocChatMessage[]) => [...prev, { role: 'assistant', content: (e instanceof Error ? e.message : 'Something went wrong. Please try again.') }]);
+            if (docChatSession.current === session) setDocChatMessages((prev) => [...prev, {
+                role: 'assistant', content: e instanceof Error ? e.message : 'Something went wrong. Please try again.',
+            }]);
         } finally {
-            setDocChatSending(false);
+            if (docChatSession.current === session) setDocChatSending(false);
         }
     };
 
@@ -918,13 +981,17 @@ export default function CourseDetailPage() {
                     <ArrowLeft size={20} />
                 </button>
                 <div className="cd-cr-tabs">
-                    {(isInstructor ? [...tabs, { id: 'review', label: 'AI review' }] : tabs).map((tab) => (
+                    {(isInstructor ? [...tabs, { id: 'review', label: 'AI review' }, { id: 'queries', label: 'Query log' }] : tabs).map((tab) => (
                         <button key={tab.id} className={`cd-cr-tab ${activeTab === tab.id ? 'active' : ''}`} onClick={() => setActiveTab(tab.id)}>
                             {tab.label}
                         </button>
                     ))}
                 </div>
             </div>
+
+            {course?.id === courseId && course.archivedAt && (
+                <p className="cd-archive-notice">Archived course. Current students can still access course materials.</p>
+            )}
 
             {/* ── Stream Tab ── */}
             {activeTab === 'stream' && (
@@ -945,6 +1012,9 @@ export default function CourseDetailPage() {
                                 <p>{courseDisplay.code}</p>
                             </div>
                         </div>
+
+                        {course?.id === courseId && <CourseSyllabus key={course.id} course={course} canEdit={isInstructor}
+                            onUpdated={(updated) => setCourse((current) => current?.id === updated.id ? updated : current)} />}
 
                         {/* Compose Post */}
                         <div className="cd-compose-card" style={isInstructor ? undefined : { display: 'none' }}>
@@ -1086,24 +1156,44 @@ export default function CourseDetailPage() {
                         )}
                         {topics.concat('No topic').map(topic => {
                             const items = itemsByTopic[topic];
-                            if ((!isInstructor || classworkFilter !== 'all') && items.length === 0 && topic !== 'No topic') return null; // hide empty topics for students and while filtering
-                            if (topic === 'No topic' && items.length === 0) return null;
                             const moduleIndex = modules.findIndex((m) => m.title === topic);
                             const module = modules[moduleIndex];
+                            const prerequisiteTopics = module ? modules.filter((entry) => module.prerequisiteIds?.includes(entry.id)) : [];
+                            const isEditorOpen = editingPrerequisites?.courseId === courseId && editingPrerequisites.moduleId === module?.id;
+                            const shownAsPrerequisite = module && requiredTopics.has(module.id);
+                            if (items.length === 0 && (topic === 'No topic' || classworkFilter !== 'all' || (!isInstructor && !shownAsPrerequisite))) return null;
 
                             return (
                                 <div key={topic} className="cd-topic-group">
                                     <div className="cd-topic-head">
-                                        <h2 className="cd-topic-title">{topic}</h2>
+                                        <h2 className="cd-topic-title" id={module ? `course-topic-${module.id}` : undefined} tabIndex={module ? -1 : undefined}>{topic}</h2>
                                         {isInstructor && module && classworkFilter === 'all' && (
                                             <div className="cd-topic-actions">
-                                                <button type="button" className="btn-icon" title="Move up" aria-label={`Move ${topic} up`} disabled={moduleIndex === 0} onClick={() => moveModule(moduleIndex, -1)}><ChevronUp size={16} /></button>
-                                                <button type="button" className="btn-icon" title="Move down" aria-label={`Move ${topic} down`} disabled={moduleIndex === modules.length - 1} onClick={() => moveModule(moduleIndex, 1)}><ChevronDown size={16} /></button>
+                                                <button type="button" className="btn-icon" title="Move up" aria-label={`Move ${topic} up`} disabled={reorderingModules || moduleIndex === 0} onClick={() => moveModule(moduleIndex, -1)}><ChevronUp size={16} /></button>
+                                                <button type="button" className="btn-icon" title="Move down" aria-label={`Move ${topic} down`} disabled={reorderingModules || moduleIndex === modules.length - 1} onClick={() => moveModule(moduleIndex, 1)}><ChevronDown size={16} /></button>
                                                 <button type="button" className="btn-icon" title="Rename" aria-label={`Rename ${topic}`} onClick={() => renameModule(module)}><Pencil size={15} /></button>
+                                                <button type="button" className="btn-icon" title="Prerequisites" aria-label={`Edit prerequisites for ${topic}`}
+                                                    aria-expanded={isEditorOpen} onClick={() => setEditingPrerequisites(isEditorOpen ? null : { courseId, moduleId: module.id })}><LinkIcon size={15} /></button>
                                                 <button type="button" className="btn-icon" title="Delete topic" aria-label={`Delete ${topic}`} onClick={() => deleteModule(module)}><Trash2 size={15} /></button>
                                             </div>
                                         )}
                                     </div>
+                                    {prerequisiteTopics.length > 0 && <div className="cd-topic-prerequisites">
+                                        <span>Study first</span>
+                                        <ul aria-label={`Prerequisites for ${topic}`}>
+                                            {prerequisiteTopics.map((entry) => <li key={entry.id}>
+                                                {classworkFilter === 'all' ? <a href={`#course-topic-${entry.id}`}
+                                                    onClick={() => document.getElementById(`course-topic-${entry.id}`)?.focus()}>{entry.title}</a> : entry.title}
+                                            </li>)}
+                                        </ul>
+                                    </div>}
+                                    {module && isEditorOpen && <ModulePrerequisites key={module.id} module={module} modules={modules}
+                                        onCancel={() => setEditingPrerequisites(null)} onSave={async (prerequisiteIds) => {
+                                            const updated = await api.patch<ModuleResponse>(`/courses/${courseId}/modules/${module.id}`, { prerequisiteIds: prerequisiteIds.map(Number) });
+                                            setModules((items) => items.map((item) => item.id === updated.id ? { ...item, prerequisiteIds: updated.prerequisiteIds } : item));
+                                            setEditingPrerequisites((current) => current?.moduleId === updated.id ? null : current);
+                                            toast.showToast('Prerequisites saved');
+                                        }} />}
                                     <div className="cd-topic-items">
                                         {items.map(item => (
                                             <div key={item.id} className="cd-cw-item">
@@ -1168,6 +1258,7 @@ export default function CourseDetailPage() {
                                                             <span className="cd-cw-due">Posted {item.createdAt}</span>
                                                             {isInstructor && (
                                                                 <>
+                                                                    <MaterialIndexBadge courseId={courseId} materialId={item.id} />
                                                                     <button
                                                                         type="button"
                                                                         className="btn-icon"
@@ -1221,6 +1312,7 @@ export default function CourseDetailPage() {
 
             {/* ── People Tab ── */}
             {activeTab === 'review' && isInstructor && courseId && <AIReviewPanel courseId={courseId} />}
+            {activeTab === 'queries' && isInstructor && courseId && <CourseQueryLog key={courseId} courseId={courseId} />}
 
             {activeTab === 'people' && (
                 <div className="cd-people-container">
@@ -1229,7 +1321,7 @@ export default function CourseDetailPage() {
                             <h2>Classmates ({peopleTotal})</h2>
                             {/* Students only reach this page once enrolled, so they need no join button here. */}
                             {isInstructor && (
-                                <button className="btn btn-primary btn-sm" onClick={() => { setShowInviteModal(true); setInviteError(''); }}>
+                                <button className="btn btn-primary btn-sm" disabled={Boolean(course?.archivedAt)} onClick={() => { setShowInviteModal(true); setInviteError(''); }}>
                                     <Mail size={15} /> Invite Students
                                 </button>
                             )}
@@ -1364,6 +1456,14 @@ export default function CourseDetailPage() {
                 </div>
             )}
 
+            {requestedMaterial && materialsLoadedFor === courseId && !viewingMaterial && (
+                <div className="cd-doc-view-overlay">
+                    <div className="cd-doc-view-fallback" role="alert">
+                        <p>This course material is unavailable.</p>
+                        <button type="button" className="btn btn-ghost" onClick={() => setViewingMaterial(null)}>Close</button>
+                    </div>
+                </div>
+            )}
             {/* Full-screen document view with PDF + AI sidebar (like reference) */}
             {viewingMaterial && (
                 <div className="cd-doc-view-overlay">
@@ -1378,7 +1478,7 @@ export default function CourseDetailPage() {
                                     so open the copy already loaded in the page instead. */}
                                 {(docPdfObjectUrl || !isUploadedMaterial(viewingMaterial)) && (
                                     <a
-                                        href={docPdfObjectUrl ?? viewingMaterial.url}
+                                        href={(docMime === 'application/pdf' ? pdfPageUrl : docPdfObjectUrl) ?? viewingMaterial.url}
                                         target="_blank"
                                         rel="noopener noreferrer"
                                         className="btn btn-outline btn-sm"
@@ -1409,11 +1509,12 @@ export default function CourseDetailPage() {
                                 ) : docPdfObjectUrl && docMime.startsWith('image/') ? (
                                     <img src={docPdfObjectUrl} alt={viewingMaterial.title} className="cd-doc-view-image" />
                                 ) : docPdfObjectUrl && docMime === 'application/pdf' ? (
-                                    <iframe
-                                        title={viewingMaterial.title}
-                                        src={docPdfObjectUrl}
-                                        className="cd-doc-view-iframe"
-                                    />
+                                    <Suspense fallback={<p className="cd-doc-view-loading" role="status">Loading PDF viewer…</p>}>
+                                        <MaterialPdf key={`${docPdfObjectUrl}:${requestedPage}`} src={docPdfObjectUrl}
+                                            title={viewingMaterial.title} documentVersion={docVersion}
+                                            initialPage={Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1}
+                                            annotationPath={`/courses/${courseId}/materials/${viewingMaterial.id}/annotations`} />
+                                    </Suspense>
                                 ) : docPdfObjectUrl ? (
                                     <div className="cd-doc-view-fallback">
                                         <p>Preview is not available for this file type.</p>
@@ -1422,6 +1523,9 @@ export default function CourseDetailPage() {
                                 ) : null}
                             </div>
                             <aside className="cd-doc-view-sidebar">
+                                {!isInstructor && <Link className="btn btn-outline btn-sm" to={`/chat?course=${courseId}&material=${viewingMaterial.id}`}>
+                                    Ask about this document in course chat
+                                </Link>}
                                 <div className="cd-doc-view-sidebar-header">
                                     <Sparkles size={18} className="cd-doc-view-sidebar-icon" />
                                     <h2 className="cd-doc-view-sidebar-title">Summary</h2>
@@ -1437,6 +1541,9 @@ export default function CourseDetailPage() {
                                         {docChatMessages.map((msg, i) => (
                                             <div key={i} className={`cd-doc-view-msg cd-doc-view-msg-${msg.role}`}>
                                                 <span className="cd-doc-view-msg-role">{msg.role === 'user' ? 'You' : 'Saarthi'}</span>
+                                                {msg.metadata?.confidence && <span className="chat-turn-badge">
+                                                    Confidence · {msg.metadata.confidence === 'ok' ? 'OK' : 'Low'}
+                                                </span>}
                                                 <div
                                                     className="cd-doc-view-msg-content"
                                                     dangerouslySetInnerHTML={{
@@ -1448,6 +1555,7 @@ export default function CourseDetailPage() {
                                                             .replace(/\n/g, '<br/>')
                                                     }}
                                                 />
+                                                <AnswerSources citations={msg.metadata?.citations} />
                                             </div>
                                         ))}
                                         {docChatFollowups.length > 0 && !docChatSending && (
@@ -1471,6 +1579,7 @@ export default function CourseDetailPage() {
                                             type="text"
                                             className="input cd-doc-view-input"
                                             placeholder="Ask about this document…"
+                                            aria-label="Question about this document"
                                             value={docChatInput}
                                             onChange={(e) => setDocChatInput(e.target.value)}
                                             onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && sendDocChatMessage()}
@@ -1482,6 +1591,7 @@ export default function CourseDetailPage() {
                                             onClick={sendDocChatMessage}
                                             disabled={!docChatInput.trim() || docChatSending}
                                             title="Send"
+                                            aria-label="Send question"
                                         >
                                             <Send size={18} />
                                         </button>

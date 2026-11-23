@@ -46,6 +46,7 @@ class Chunk:
     score: float | None = None
     via: str | None = None
     language: str | None = None
+    material_id: int | None = None
 
 
 # Per-request trace of the last retrieve() call (legs used, hops, boosts) for telemetry.
@@ -79,6 +80,7 @@ def _docs_to_chunks(docs, content_type: str) -> list[Chunk]:
                 score=md.get("score"),
                 via="dense",
                 language=md.get("language"),
+                material_id=md.get("material_id"),
             )
         )
     return out
@@ -100,6 +102,7 @@ def _hit_to_chunk(h) -> Chunk:
         score=h.score,
         via=h.via,
         language=md.get("language"),
+        material_id=md.get("material_id"),
     )
 
 

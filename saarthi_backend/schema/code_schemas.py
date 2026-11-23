@@ -68,10 +68,14 @@ class CodeProblemResponse(BaseModel):
     topics: Optional[str]
     sortOrder: int
     testCases: list[TestCasePublic] = []
+    courseId: Optional[int] = None      # None = practice problem
+    courseTitle: Optional[str] = None
+    topic: Optional[str] = None         # lesson (Classwork topic)
+    canEdit: bool = False               # editors also get hidden test cases in full
 
 
 class CodeProblemCreate(BaseModel):
-    title: str
+    title: str = Field(..., min_length=1, max_length=200)
     difficulty: str = "medium"
     points: int = 50
     description: str
@@ -82,6 +86,8 @@ class CodeProblemCreate(BaseModel):
     topics: Optional[str] = None
     sortOrder: int = 0
     testCases: list[TestCase] = []
+    courseId: Optional[int] = None      # required for teachers; admins may leave it empty
+    topic: Optional[str] = Field(default=None, max_length=128)
 
 
 class CodeProblemUpdate(BaseModel):
@@ -97,6 +103,7 @@ class CodeProblemUpdate(BaseModel):
     sortOrder: Optional[int] = None
     isActive: Optional[bool] = None
     testCases: Optional[list[TestCase]] = None
+    topic: Optional[str] = Field(default=None, max_length=128)  # "" moves it to "No topic"
 
 
 class CodeSubmitRequest(BaseModel):

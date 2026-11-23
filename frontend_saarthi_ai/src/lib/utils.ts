@@ -19,6 +19,11 @@ export function formatTime(minutes: number): string {
     return `${h}h ${m}min`;
 }
 
+export function formatStudyTime(seconds: number): string {
+    if (seconds > 0 && seconds < 60) return `${seconds} sec`;
+    return formatTime(Math.floor(seconds / 60));
+}
+
 export function getInitials(name: string): string {
     return name
         .split(' ')

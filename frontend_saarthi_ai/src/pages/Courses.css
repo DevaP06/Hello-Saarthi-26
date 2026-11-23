@@ -336,6 +336,7 @@
 
 /* Admin Actions */
 .course-card-admin-actions {
+    flex-wrap: wrap;
     display: flex;
     gap: 0.5rem;
     flex-wrap: wrap;

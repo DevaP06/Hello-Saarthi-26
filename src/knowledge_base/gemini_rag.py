@@ -18,11 +18,13 @@ Settings (saarthi_backend/.env, saarthi_backend/.env.kb):
 """
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
 import threading
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,7 +65,7 @@ def chat_model() -> str:
 def _client():
     from openai import OpenAI
 
-    return OpenAI(api_key=_gemini_key(), base_url=GEMINI_BASE_URL, timeout=60, max_retries=2)
+    return OpenAI(api_key=_gemini_key(), base_url=GEMINI_BASE_URL, timeout=60, max_retries=5)
 
 
 def _qdrant_settings() -> tuple[str, str, str]:
@@ -98,8 +100,18 @@ def fetch_qdrant_chunks() -> list[dict]:
             f"{url}/collections/{collection}/points/scroll",
             data=json.dumps(body).encode(), headers=headers, method="POST",
         )
-        with urllib.request.urlopen(req, timeout=60) as r:
-            result = json.loads(r.read())["result"]
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    result = json.loads(r.read())["result"]
+                break
+            except urllib.error.HTTPError:
+                raise  # bad key / collection: retrying will not help
+            except (OSError, http.client.HTTPException) as e:  # DNS, reset, timeout, IncompleteRead
+                if attempt == 4:
+                    raise
+                logger.warning("Qdrant request failed (%s); retrying in %ss", e, 3 * (attempt + 1))
+                time.sleep(3 * (attempt + 1))
         for p in result["points"]:
             payload = p.get("payload") or {}
             if (payload.get("text") or "").strip():

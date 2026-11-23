@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { BarChart3, Download, HelpCircle, Loader2, Target, TriangleAlert, Users } from 'lucide-react';
 import { api, apiUrl, authFetch } from '../lib/api';
+import { formatStudyTime } from '../lib/utils';
 import './Progress.css';
 
 interface StudentRow {
@@ -19,6 +20,11 @@ interface ClassPerformanceResponse {
         students: StudentRow[];
         topics: { topic: string; correct: number; total: number; accuracy: number }[];
         mostMissed: { question: string; topic: string | null; missed: number; answered: number; missRate: number }[];
+        readership: {
+            activeLearners7Days: number;
+            topics: { topic: string; learners: number; opens: number; averageSeconds: number }[];
+            dropoffs: { fromTopic: string; toTopic: string; learners: number }[];
+        };
     } | null;
 }
 
@@ -34,16 +40,18 @@ export default function ClassPerformance() {
     const [exporting, setExporting] = useState(false);
 
     useEffect(() => {
+        let cancelled = false;
         const t = setTimeout(() => {
             api.get<ClassPerformanceResponse>('/progress/class', { ...(courseId ? { courseId } : {}), threshold })
                 .then((d) => {
+                    if (cancelled) return;
                     setData(d);
                     setError(null);
                     if (!courseId && d.performance) setCourseId(d.performance.course.id);
                 })
-                .catch((e) => setError(e instanceof Error ? e.message : 'Failed to load class performance'));
+                .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load class performance'); });
         }, 250);
-        return () => clearTimeout(t);
+        return () => { cancelled = true; clearTimeout(t); };
     }, [courseId, threshold]);
 
     const exportCsv = async () => {
@@ -72,6 +80,7 @@ export default function ClassPerformance() {
     if (!perf) return null;
     const maxBin = Math.max(1, ...perf.histogram.map((h) => h.students));
     const s = perf.summary;
+    const readership = perf.readership;
 
     return (
         <>
@@ -104,6 +113,44 @@ export default function ClassPerformance() {
                     </span>
                 </div>
                 {error && <p role="alert" className="progress-activity-time">{error}</p>}
+
+                <section className="progress-readership" aria-labelledby="readership-heading">
+                    <h4 id="readership-heading" className="progress-subhead">Chapter Readership</h4>
+                    <p className="progress-activity-time">{readership.activeLearners7Days} active learners in the last 7 days</p>
+                    {readership.topics.length === 0 ? (
+                        <p className="progress-activity-time">No course topics yet.</p>
+                    ) : (
+                        <div className="progress-table-wrap">
+                            <table className="progress-table" aria-label="Chapter readership in the last 7 days">
+                                <thead><tr><th scope="col">Topic</th><th scope="col">Learners</th><th scope="col">Opens</th><th scope="col">Average study time per student</th></tr></thead>
+                                <tbody>{readership.topics.map((topic) => (
+                                    <tr key={topic.topic}>
+                                        <th scope="row">{topic.topic}</th>
+                                        <td>
+                                            <span className="progress-heat-cell" style={{
+                                                backgroundColor: `rgba(110, 175, 164, ${s.students ? 0.65 * topic.learners / s.students : 0})`,
+                                            }}>{topic.learners}/{s.students}</span>
+                                        </td>
+                                        <td>{topic.opens}</td>
+                                        <td>{formatStudyTime(topic.averageSeconds)}</td>
+                                    </tr>
+                                ))}</tbody>
+                            </table>
+                        </div>
+                    )}
+                    <h5 className="progress-subhead">Drop-off Points</h5>
+                    {readership.dropoffs.length ? (
+                        <ul className="progress-dropoffs">
+                            {readership.dropoffs.map((point) => (
+                                <li key={point.fromTopic}>
+                                    <strong>{point.learners}</strong> visited {point.fromTopic} and did not visit {point.toTopic} in the last 7 days.
+                                </li>
+                            ))}
+                        </ul>
+                    ) : <p className="progress-activity-time">
+                        {readership.topics.some((topic) => topic.learners > 0) ? 'No drop-off points in the last 7 days.' : 'No chapter visits recorded in the last 7 days.'}
+                    </p>}
+                </section>
 
                 <div className="progress-grid" style={{ marginBottom: 0 }}>
                     <div>

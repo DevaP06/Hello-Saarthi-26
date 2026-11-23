@@ -165,9 +165,10 @@ def chat_llm(*, temperature: float = 0, max_tokens: int | None = None, fast: boo
     if cfg["base_url"]:
         kwargs["base_url"] = cfg["base_url"]
         kwargs["default_headers"] = _openrouter_headers()
-        if max_tokens is not None and "api.openai.com" not in cfg["base_url"]:
+        if max_tokens is not None and not any(h in cfg["base_url"] for h in ("api.openai.com", "googleapis.com")):
             # langchain-openai sends `max_completion_tokens`, which Ollama's OpenAI-compatible
             # API ignores (a 1B router once generated 40,960 tokens). Send the legacy field too.
+            # Not for Gemini: it rejects requests carrying both fields (400 INVALID_ARGUMENT).
             kwargs["extra_body"] = {**(extra.pop("extra_body", None) or {}), "max_tokens": max_tokens}
     think = reasoning_body(t)
     if think:

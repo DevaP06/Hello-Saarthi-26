@@ -1,7 +1,10 @@
 import { useState, useRef, useEffect } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Play, Pause, RotateCcw, Volume2, Settings, Maximize, MessageCircle, FileText, CheckCircle2, ChevronRight, Clock, Plus } from 'lucide-react';
 import { api, type VideoResponse, type VideoNoteResponse } from '../lib/api';
+import { useResourceActivity } from '../lib/useResourceActivity';
+import { useAuthStore } from '../stores/auth.store';
+import VideoEmbed from '../components/VideoEmbed';
 import './VideoPlayer.css';
 
 interface Chapter {
@@ -28,11 +31,16 @@ function parseChapters(chaptersJson?: string | null): Chapter[] {
 export default function VideoPlayerPage() {
     const { id } = useParams<{ id: string }>();
     const navigate = useNavigate();
+    const [searchParams] = useSearchParams();
+    const timestamp = searchParams.get('t');
+    const start = Number(timestamp);
+    const startSeconds = timestamp && Number.isSafeInteger(start) && start >= 0 ? start : null;
     const videoRef = useRef<HTMLVideoElement>(null);
+    const embedPlaying = useRef(false);
+    const savedCompletion = useRef<string | null>(null);
+    const isStudent = useAuthStore((state) => state.user?.role === 'student');
 
-    const [video, setVideo] = useState<VideoResponse | null>(null);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState<string | null>(null);
+    const [result, setResult] = useState<{ id: string; video?: VideoResponse; error?: string } | null>(null);
     const [notes, setNotes] = useState<VideoNoteResponse[]>([]);
     const [newNote, setNewNote] = useState('');
     const [noteTimeSeconds, setNoteTimeSeconds] = useState(0);
@@ -42,28 +50,35 @@ export default function VideoPlayerPage() {
     const [volume, setVolume] = useState(1);
     const [activeTab, setActiveTab] = useState<'notes' | 'discussion'>('notes');
 
+    const current = result?.id === id ? result : null;
+    const video = current?.video ?? null;
+    const loading = Boolean(id && !current);
+    const error = id ? current?.error : 'Invalid video';
     const isEmbed = Boolean(video?.embedUrl);
     const chapters: Chapter[] = video ? parseChapters(video.chaptersJson) : [];
     const duration = video?.durationSeconds ?? 0;
+    useResourceActivity('video', !loading && video?.id === id ? id : undefined, () => {
+        if (isEmbed) return embedPlaying.current;
+        const player = videoRef.current;
+        return Boolean(player && !player.paused && !player.ended && !player.seeking && player.readyState >= 3);
+    });
+
+    const saveCompletion = (positionSeconds: number) => {
+        if (!isStudent || !id || video?.id !== id || savedCompletion.current === id) return;
+        savedCompletion.current = id;
+        void api.put(`/videos/${id}/progress`, { positionSeconds: Math.max(0, Math.floor(positionSeconds)), completed: true })
+            .catch(() => { if (savedCompletion.current === id) savedCompletion.current = null; });
+    };
 
     useEffect(() => {
-        if (!id) {
-            setError('Invalid video');
-            setLoading(false);
-            return;
-        }
+        if (!id) return;
         let cancelled = false;
-        setLoading(true);
-        setError(null);
         api.get<VideoResponse>(`/videos/${id}`)
-            .then((v) => {
-                if (!cancelled) setVideo(v);
+            .then((video) => {
+                if (!cancelled) setResult({ id, video });
             })
             .catch((e) => {
-                if (!cancelled) setError(e instanceof Error ? e.message : 'Video not found');
-            })
-            .finally(() => {
-                if (!cancelled) setLoading(false);
+                if (!cancelled) setResult({ id, error: e instanceof Error ? e.message : 'Video not found' });
             });
         return () => { cancelled = true; };
     }, [id]);
@@ -78,11 +93,10 @@ export default function VideoPlayerPage() {
     }, [id, video]);
 
     const togglePlay = () => {
-        if (videoRef.current) {
-            if (playing) videoRef.current.pause();
-            else videoRef.current.play();
-            setPlaying(!playing);
-        }
+        const player = videoRef.current;
+        if (!player) return;
+        if (player.paused) void player.play().catch(() => {});
+        else player.pause();
     };
 
     const handleTimeUpdate = () => {
@@ -153,21 +167,31 @@ export default function VideoPlayerPage() {
 
                 <div className="video-container">
                     {isEmbed ? (
-                        <iframe
+                        <VideoEmbed
                             src={video.embedUrl!}
                             title={video.title}
-                            className="video-element video-iframe"
-                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                            allowFullScreen
+                            startSeconds={startSeconds}
+                            onPlayback={(active, completedAt) => {
+                                embedPlaying.current = active;
+                                if (completedAt !== undefined) saveCompletion(completedAt);
+                            }}
                         />
                     ) : (
                         <>
                             <video
+                                key={`${video.id}:${startSeconds ?? ''}`}
                                 ref={videoRef}
                                 src={video.url}
                                 className="video-element"
+                                onLoadedMetadata={() => { if (startSeconds !== null) seekTo(startSeconds); }}
                                 onTimeUpdate={handleTimeUpdate}
                                 onClick={togglePlay}
+                                onPlaying={() => setPlaying(true)}
+                                onPause={() => setPlaying(false)}
+                                onEnded={(event) => {
+                                    setPlaying(false);
+                                    saveCompletion(event.currentTarget.currentTime);
+                                }}
                             />
                             <div className="video-controls-overlay">
                                 <div className="video-progress-container" onClick={(e) => {

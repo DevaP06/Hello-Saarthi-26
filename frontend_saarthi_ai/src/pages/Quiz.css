@@ -536,3 +536,24 @@
 .quiz-option:disabled {
     cursor: default;
 }
+.quiz-review-link,
+.quiz-review-action {
+    margin-top: 0.8rem;
+}
+
+.quiz-review-card {
+    padding: 1rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+}
+
+.quiz-review-action {
+    display: flex;
+    justify-content: flex-end;
+}
+
+.quiz-review-error {
+    padding: 0.75rem;
+    margin-bottom: 0.75rem;
+    border: 1px solid var(--border);
+}

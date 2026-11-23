@@ -4,7 +4,7 @@ from typing import Annotated
 
 import json
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,12 +19,15 @@ from saarthi_backend.schema.quiz_schemas import (
     QuizAttemptSubmitRequest,
     QuizCreate,
     QuizDetailResponse,
+    QuizPracticeAnswer,
+    QuizPracticeFeedback,
+    QuizPracticeQueue,
     QuizQuestionCreate,
     QuizQuestionResponse,
     QuizQuestionUpdate,
     QuizResponse,
 )
-from saarthi_backend.service import course_service, quiz_service
+from saarthi_backend.service import course_service, quiz_practice_service, quiz_service
 from saarthi_backend.service.access_scope import retrieval_scope
 from saarthi_backend.utils.exceptions import ForbiddenError, NotFoundError, ValidationError
 
@@ -239,6 +242,27 @@ async def peer_comparison(
 ):
     """Return the current user's score percentile against all peers."""
     return await quiz_service.get_peer_comparison(db, user.id)
+
+
+@router.get("/review/queue", response_model=QuizPracticeQueue)
+async def practice_queue(
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    courseId: Annotated[int | None, Query(gt=0, le=2_147_483_647)] = None,
+    topic: Annotated[str, Query(max_length=128)] = "",
+    limit: Annotated[int, Query(ge=1, le=30)] = 10,
+):
+    return await quiz_practice_service.review_queue(db, user, course_id=courseId, topic=topic.strip(), limit=limit)
+
+
+@router.post("/review/{question_id}/answer", response_model=QuizPracticeFeedback)
+async def answer_practice_question(
+    question_id: int,
+    body: QuizPracticeAnswer,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    return await quiz_practice_service.answer_review(db, user, question_id, body)
 
 
 @router.get("/{quiz_id}", response_model=QuizDetailResponse)
