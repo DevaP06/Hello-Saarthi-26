@@ -1,0 +1,123 @@
+# Production stack for the Ubuntu GPU host.
+#
+#   docker compose -f docker-compose.prod.yml --env-file deploy/.env.production up -d --build
+#   ... add  --profile tunnel   to publish through Cloudflare
+#   ... add  --profile gpu      to run the local Ollama fallback model
+#
+# See docs/DEPLOYMENT.md. Postgres is Neon and Qdrant is Qdrant Cloud (both external).
+name: saarthi
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.backend
+    env_file: deploy/.env.production
+    environment:
+      SANDBOX_URL: http://sandbox:8100        # student code runs in the sandbox service, never here
+    restart: unless-stopped
+    depends_on:
+      - sandbox
+    networks: [default, sandbox_net]
+    # Startup (migrations + loading ML libs) can take >90s on a laptop; check every 5s until then.
+    healthcheck:
+      start_period: 300s
+      start_interval: 5s
+    # Not published to the host: only the web container (Caddy) can reach it.
+    expose:
+      - "8000"
+    volumes:
+      - saarthi_uploads:/app/uploads          # teacher/student uploads
+      - saarthi_kb:/app/knowledge_base        # FAISS indexes + gemini_kb/index.json
+      - saarthi_logs:/app/logs
+
+  # Runs Code Lab submissions. The sandbox image adds Octave to the Python runtime.
+  # It has no env_file and runs solely on the internal network.
+  sandbox:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.backend
+      target: sandbox
+    entrypoint: ["python", "saarthi_backend/service/sandbox_server.py"]
+    environment:
+      PYTHONPATH: /app
+      HOME: /tmp
+      SANDBOX_TIMEOUT_SEC: "30"
+    restart: unless-stopped
+    user: "65534:65534"                       # nobody
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    networks: [sandbox_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.web
+    environment:
+      # Sent to the backend so it trusts Caddy's X-Forwarded-For (and nobody else's).
+      PROXY_SECRET: ${PROXY_SECRET:?set PROXY_SECRET in deploy/.env.production}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:80"                   # local smoke test: http://localhost:8080
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}   # required only with --profile tunnel
+    depends_on:
+      - web
+
+  # Free public link, no Cloudflare account or domain. The https://…trycloudflare.com
+  # address changes on every restart: read it with  docker compose … logs quicktunnel
+  quicktunnel:
+    image: cloudflare/cloudflared:latest
+    profiles: ["quicktunnel"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://web:80
+    depends_on:
+      - web
+
+  # Local model served on the GPU. Not reachable from outside the compose network.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["gpu"]
+    restart: unless-stopped
+    environment:
+      OLLAMA_CONTEXT_LENGTH: "8192"
+      OLLAMA_KEEP_ALIVE: "30m"
+    volumes:
+      - ollama_models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+networks:
+  sandbox_net:
+    internal: true                            # no route to the internet
+
+volumes:
+  saarthi_uploads:
+  saarthi_kb:
+  saarthi_logs:
+  ollama_models:

@@ -1,0 +1,14 @@
+# Builds the React app (served from "/") and bundles it with Caddy, which also
+# reverse-proxies /api and /uploads to the backend container.
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY frontend_saarthi_ai/package.json frontend_saarthi_ai/package-lock.json ./
+RUN npm ci
+COPY frontend_saarthi_ai/ ./
+# Same-origin deployment: API is /api, app lives at the site root.
+ENV VITE_BASE=/
+RUN npm run build
+
+FROM caddy:2-alpine
+COPY --from=build /app/dist /srv
+COPY deploy/Caddyfile /etc/caddy/Caddyfile

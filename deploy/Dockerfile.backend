@@ -1,0 +1,41 @@
+# Saarthi backend (FastAPI + in-process LangGraph). Serves users; heavy ingestion
+# (OCR / Whisper / KB build) runs on the GPU host outside this image.
+FROM python:3.12-slim AS backend
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    KMP_DUPLICATE_LIB_OK=TRUE
+
+WORKDIR /app
+
+# System libs: OpenCV / PDF rendering need these; curl for debugging.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# CPU-only torch keeps the image ~6 GB smaller; serving users never needs CUDA here.
+COPY saarthi_backend/requirements.txt /tmp/requirements.txt
+RUN pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu \
+    && pip install -r /tmp/requirements.txt \
+    # Imported by the running backend but missing from the pinned list:
+    && pip install "portalocker>=2.7.0" "qdrant-client>=1.9" pymupdf pdfplumber
+
+COPY saarthi_backend ./saarthi_backend
+COPY src ./src
+COPY scripts ./scripts
+COPY deploy/entrypoint.sh /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh && mkdir -p /app/uploads /app/knowledge_base /app/logs
+
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"
+
+ENTRYPOINT ["/entrypoint.sh"]
+
+FROM backend AS sandbox
+RUN apt-get update && apt-get install -y --no-install-recommends octave octave-signal \
+    && rm -rf /var/lib/apt/lists/*
+
+# Keep the default build compatible with callers that only build the API image.
+FROM backend AS api

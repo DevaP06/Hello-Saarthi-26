@@ -1,0 +1,33 @@
+# TLS is terminated by Cloudflare (the tunnel), so Caddy serves plain HTTP on :80.
+:80 {
+	encode gzip
+
+	# API + uploaded files -> backend. flush_interval -1 keeps the chat SSE stream live.
+	# X-Forwarded-For is overwritten with Cloudflare's real client IP so the backend's
+	# per-IP rate limiter cannot be spoofed by a client-supplied header.
+	@backend path /api/* /uploads/*
+	handle @backend {
+		reverse_proxy backend:8000 {
+			flush_interval -1
+			header_up X-Forwarded-For {header.CF-Connecting-IP}
+			# Proves to the backend that X-Forwarded-For came from this proxy.
+			header_up X-Saarthi-Proxy {$PROXY_SECRET}
+			transport http {
+				response_header_timeout 180s
+			}
+		}
+	}
+
+	# Everything else is the single-page app.
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+}

@@ -1,0 +1,28 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+node_modules
+frontend_saarthi_ai/node_modules
+frontend_saarthi_ai/dist
+
+# Secrets never go into an image
+**/.env
+**/.env.*
+!**/.env*.example
+
+# Runtime data lives in volumes, not the image
+uploads
+knowledge_base
+logs
+data
+eval
+docs
+tests
+**/tests
+test_data
+ui
+architecture
+"backend framework docs"
+llm-backend
+saarthi_phase1_openrouter
