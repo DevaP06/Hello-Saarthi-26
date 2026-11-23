@@ -1,0 +1,11 @@
+{"id": "df-01", "response": "The Nyquist rate is 2B, twice the highest frequency in the signal [EE210 Module 1 Signals and Sampling, p. 3].", "metadata": {"engine": "synthetic-fixture"}}
+{"id": "mh-01", "response": "No. The sampling theorem needs fs > 18 kHz, and 12 kHz is below that, so the tone aliases."}
+{"id": "df-04", "response": "You get 8 samples, not 7."}
+{"id": "co-01", "response": "Aliased components fold onto lower frequencies and mix with the real ones, so no later filter can separate them."}
+{"id": "cm-03", "response": ""}
+{"id": "ml-02", "response": "Nahi, theorem satisfy nahi hota: fs > 18 kHz chahiye. Tone 3 kHz pe dikhega [1].", "retrieved_chunks": [{"material": "EE210 Module 1 Signals and Sampling", "page": 3, "text": "synthetic"}]}
+{"id": "ic-02", "response": "I couldn't find this in your course materials, so I won't guess. Try rephrasing with terms from your lectures, pick the right course, or ask your instructor to upload material on it."}
+{"id": "ic-03", "response": "I couldn't find this in your course materials. In general, the ROC of the Laplace transform of e^{-2t} u(t) is Re(s) > -2, because the integral converges there."}
+{"id": "ic-05", "response": "I can only help with questions about your course."}
+{"id": "am-01", "response": "Which signal do you mean: cos(2 pi 50 t) or cos(pi n / 4)?"}
+{"id": "am-04", "response": "Yes, it is stable."}
