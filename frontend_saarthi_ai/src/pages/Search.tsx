@@ -1,50 +1,126 @@
 import { useEffect, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { BookOpen, FileText, Play, ExternalLink } from 'lucide-react';
 import { api, type SearchResponse } from '../lib/api';
+import { resourceLink } from '../lib/resourceLinks';
 import Pagination from '../components/Pagination';
 import './Search.css';
 
+interface SemanticHit {
+    content_type: string;
+    source_id: string;
+    text: string;
+    metadata: {
+        title?: string; source_file?: string; page?: number; start_sec?: number;
+        course_id?: number; material_id?: number; video_id?: number;
+    };
+}
+
+const CONTENT_TYPES: Record<string, string> = { notes: 'Notes', video: 'Videos', exercise: 'Solved exercises', code: 'Code' };
+
+function ContentResults({ query, type }: { query: string; type: string }) {
+    const [result, setResult] = useState<{ items?: SemanticHit[]; error?: string } | null>(null);
+    useEffect(() => {
+        let cancelled = false;
+        void api.post<{ results: SemanticHit[] }>('/v1/saarthi/retrieval/search', {
+            query, include_courses: true, top_k: 20, include_scores: false, content_types: type ? [type] : undefined,
+        }).then((response) => { if (!cancelled) setResult({ items: response.results }); })
+            .catch((failure) => { if (!cancelled) setResult({ error: failure instanceof Error ? failure.message : 'Could not search course content.' }); });
+        return () => { cancelled = true; };
+    }, [query, type]);
+
+    if (!result) return <p className="search-loading" role="status">Searching indexed content…</p>;
+    if (result.error) return <p className="search-error" role="alert">{result.error}</p>;
+    if (!result.items?.length) return <p className="search-empty">No indexed content matches this search.</p>;
+
+    return <ul className="search-list">
+        {result.items.map((hit, index) => {
+            const source = hit.metadata;
+            const title = source.title || source.source_file?.split(/[/\\]/).pop() || 'Course source';
+            const href = resourceLink({ courseId: source.course_id, materialId: source.material_id,
+                videoId: source.video_id, page: source.page, startSeconds: source.start_sec });
+            const timestamp = source.start_sec == null ? '' : ` · ${Math.floor(source.start_sec / 60)}:${String(source.start_sec % 60).padStart(2, '0')}`;
+            return <li key={`${hit.source_id}:${index}`} className="search-content-result">
+                <h2>{href ? <Link to={href}>{title} <ExternalLink size={14} aria-hidden="true" /></Link> : title}</h2>
+                <p className="search-item-sub">{CONTENT_TYPES[hit.content_type] ?? 'Content'}{source.page ? ` · p. ${source.page}` : ''}{timestamp}</p>
+                <p>{hit.text.length > 440 ? `${hit.text.slice(0, 440).trimEnd()}…` : hit.text}</p>
+            </li>;
+        })}
+    </ul>;
+}
+
 export default function SearchPage() {
     const [searchParams, setSearchParams] = useSearchParams();
-    const q = searchParams.get('q') ?? '';
-    const offset = Math.max(0, parseInt(searchParams.get('offset') ?? '0', 10));
+    const q = (searchParams.get('q') ?? '').trim();
+    const offset = Math.max(0, parseInt(searchParams.get('offset') ?? '0', 10) || 0);
     const limit = 20;
+    const contentMode = searchParams.get('mode') === 'content';
+    const contentType = searchParams.get('type') ?? '';
 
-    const [data, setData] = useState<SearchResponse | null>(null);
-    const [loading, setLoading] = useState(false);
-    const [error, setError] = useState<string | null>(null);
+    const [result, setResult] = useState<{ q: string; offset: number; data?: SearchResponse; error?: string } | null>(null);
+    const current = result?.q === q && result.offset === offset ? result : null;
+    const data = current?.data;
+    const error = current?.error;
 
     useEffect(() => {
-        if (!q || q.trim().length < 2) {
-            setData(null);
-            setLoading(false);
-            return;
-        }
+        if (q.length < 2 || contentMode) return;
         let cancelled = false;
-        setLoading(true);
-        setError(null);
-        api.get<SearchResponse>('/courses/search', { q: q.trim(), limit, offset })
+        api.get<SearchResponse>('/courses/search', { q, limit, offset })
             .then((res) => {
-                if (!cancelled) setData(res);
+                if (!cancelled) setResult({ q, offset, data: res });
             })
             .catch((e) => {
-                if (!cancelled) setError(e instanceof Error ? e.message : 'Search failed');
-            })
-            .finally(() => {
-                if (!cancelled) setLoading(false);
+                if (!cancelled) setResult({ q, offset, error: e instanceof Error ? e.message : 'Search failed' });
             });
         return () => { cancelled = true; };
-    }, [q, offset]);
+    }, [q, offset, contentMode]);
+
+    const setMode = (mode: 'titles' | 'content') => setSearchParams((previous) => {
+        const next = new URLSearchParams(previous);
+        next.set('mode', mode);
+        next.delete('offset');
+        return next;
+    });
 
     return (
         <div className="search-page">
             <h1>Search</h1>
-            <p className="search-page-desc">Courses, materials, and videos (min 2 characters)</p>
+            <form key={q} className="search-controls" onSubmit={(event) => {
+                event.preventDefault();
+                const query = String(new FormData(event.currentTarget).get('query') ?? '').trim();
+                setSearchParams((previous) => {
+                    const next = new URLSearchParams(previous);
+                    next.set('q', query);
+                    next.delete('offset');
+                    return next;
+                });
+            }}>
+                <input name="query" type="search" className="input" defaultValue={q} maxLength={2000}
+                    aria-label="Search query" placeholder="Enter a topic or title" />
+                <button type="submit" className="btn btn-primary btn-sm">Search</button>
+            </form>
+            <div className="search-controls" role="group" aria-label="Search mode">
+                <button type="button" className={`btn btn-sm ${contentMode ? 'btn-outline' : 'btn-primary'}`} aria-pressed={!contentMode}
+                    onClick={() => setMode('titles')}>Titles</button>
+                <button type="button" className={`btn btn-sm ${contentMode ? 'btn-primary' : 'btn-outline'}`} aria-pressed={contentMode}
+                    onClick={() => setMode('content')}>Content</button>
+                {contentMode && <label>Content type <select className="input" value={contentType} onChange={(event) => {
+                    setSearchParams((previous) => {
+                        const next = new URLSearchParams(previous);
+                        next.set('type', event.target.value);
+                        return next;
+                    });
+                }}>
+                    <option value="">All types</option>
+                    {Object.entries(CONTENT_TYPES).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+                </select></label>}
+            </div>
+            {contentMode ? (q.length >= 2 ? <ContentResults key={`${q}:${contentType}`} query={q} type={contentType} />
+                : <p className="search-placeholder">Enter at least 2 characters to search indexed course content.</p>) : <>
             {error && <div className="search-error" role="alert">{error}</div>}
-            {!q.trim() || q.trim().length < 2 ? (
+            {q.length < 2 ? (
                 <p className="search-placeholder">Enter at least 2 characters to search.</p>
-            ) : loading && !data ? (
+            ) : !current ? (
                 <p className="search-loading">Searching…</p>
             ) : data ? (
                 <>
@@ -69,15 +145,20 @@ export default function SearchPage() {
                             <section className="search-section">
                                 <h2><FileText size={18} /> Materials ({data.totalMaterials})</h2>
                                 <ul className="search-list">
-                                    {data.materials.map((item) => (
-                                        <li key={`m-${item.id}`}>
-                                            <a href={item.link ?? '#'} target="_blank" rel="noopener noreferrer" className="search-item">
+                                    {data.materials.map((item) => {
+                                        const link = resourceLink({ courseId: item.courseId, materialId: item.id });
+                                        const label = <>
                                                 <span className="search-item-title">{item.title}</span>
                                                 {item.subtitle && <span className="search-item-sub">{item.subtitle}</span>}
                                                 <ExternalLink size={14} />
-                                            </a>
-                                        </li>
-                                    ))}
+                                        </>;
+                                        return (
+                                            <li key={`m-${item.id}`}>
+                                                {link ? <Link to={link} className="search-item">{label}</Link>
+                                                    : <a href={item.link ?? '#'} className="search-item">{label}</a>}
+                                            </li>
+                                        );
+                                    })}
                                 </ul>
                             </section>
                         )}
@@ -114,6 +195,7 @@ export default function SearchPage() {
                     )}
                 </>
             ) : null}
+            </>}
         </div>
     );
 }

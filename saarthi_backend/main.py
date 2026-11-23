@@ -113,6 +113,11 @@ _CLASSROOM_INVITES_DDL = _load_classroom_invites_ddl()
 _STARTUP_DDL = _CLASSROOM_INVITES_DDL + _load_ddl("012_answer_reviews.sql")
 _MODULES_QUIZZES_CODE_DDL = _load_ddl("011_modules_quizzes_code.sql")
 _QA_REVIEW_ACTIONS_DDL = _load_ddl("009_qa_review_actions.sql")
+_ACTIVITY_EVENTS_DDL = _load_ddl("014_activity_events.sql")
+_COURSE_CHAT_DDL = _load_ddl("015_course_chat.sql")
+_QUIZ_PRACTICE_DDL = _load_ddl("016_quiz_practice.sql")
+_RESOURCE_ANNOTATIONS_DDL = _load_ddl("017_resource_annotations.sql")
+_COURSE_MANAGEMENT_DDL = _load_ddl("018_course_management.sql")
 
 
 @asynccontextmanager
@@ -141,23 +146,6 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE saarthi_assignments ADD COLUMN IF NOT EXISTS hard_deadline BOOLEAN NOT NULL DEFAULT FALSE"
         ))
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS saarthi_code_problems (
-                id SERIAL PRIMARY KEY,
-                title TEXT NOT NULL,
-                difficulty TEXT NOT NULL DEFAULT 'medium',
-                points INTEGER NOT NULL DEFAULT 50,
-                description TEXT NOT NULL DEFAULT '',
-                requirements_json TEXT,
-                expected_output TEXT,
-                hints_json TEXT,
-                starter_code_json TEXT,
-                topics TEXT,
-                sort_order INTEGER NOT NULL DEFAULT 0,
-                is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            )
-        """))
         # Invites / class codes had an ORM model but no migration (see 008_classroom_invites.sql).
         for stmt in _STARTUP_DDL:
             await conn.execute(text(stmt))
@@ -168,6 +156,16 @@ async def lifespan(app: FastAPI):
         await conn.execute(text("ALTER TABLE saarthi_qa_review_actions ADD COLUMN IF NOT EXISTS edited BOOLEAN NOT NULL DEFAULT FALSE"))
         # Quiz fields, course modules, bookmarks, code test cases and submissions (011).
         for stmt in _MODULES_QUIZZES_CODE_DDL:
+            await conn.execute(text(stmt))
+        for stmt in _ACTIVITY_EVENTS_DDL:
+            await conn.execute(text(stmt))
+        for stmt in _COURSE_CHAT_DDL:
+            await conn.execute(text(stmt))
+        for stmt in _QUIZ_PRACTICE_DDL:
+            await conn.execute(text(stmt))
+        for stmt in _RESOURCE_ANNOTATIONS_DDL:
+            await conn.execute(text(stmt))
+        for stmt in _COURSE_MANAGEMENT_DDL:
             await conn.execute(text(stmt))
     logger.info("Column migration: saarthi_videos.transcript_text ensured")
     logger.info("Table migration: saarthi_code_problems ensured")
@@ -241,6 +239,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Document-Version"],
 )
 
 # Explicit OPTIONS handler — returns 200 for all preflight requests before any other middleware

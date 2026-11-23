@@ -4,18 +4,21 @@ import json
 import mimetypes
 import uuid
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
+from urllib.parse import quote
 
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, UploadFile, Request, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import StreamingResponse, JSONResponse
-from sqlalchemy import select, update
+from fastapi.responses import StreamingResponse, JSONResponse, Response
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from saarthi_backend.deps import get_current_user, get_db, get_pagination
-from saarthi_backend.model import Assignment, Bookmark, CourseModule, Material, Quiz, User, Video
+from saarthi_backend.model import Assignment, Bookmark, CodeProblem, Course, CourseModule, Material, Quiz, User, Video
+from saarthi_backend.model.course_model import MaterialAnnotation, ModulePrerequisite
 from saarthi_backend.schema.course_schemas import (
     AssignmentCreate,
     AssignmentResponse,
@@ -26,8 +29,10 @@ from saarthi_backend.schema.course_schemas import (
     BookmarkCreate,
     BookmarkResponse,
     ModuleCreate,
+    ModuleOrderUpdate,
     ModuleResponse,
     ModuleUpdate,
+    CourseArchiveUpdate,
     CourseCreate,
     CourseUpdate,
     CoursePersonResponse,
@@ -41,6 +46,8 @@ from saarthi_backend.schema.course_schemas import (
     JoinRequest,
     JoinResponse,
     MaterialCreate,
+    MaterialAnnotationCreate,
+    MaterialAnnotationResponse,
     MaterialResponse,
     MaterialUpdate,
     SearchItem,
@@ -82,6 +89,9 @@ _CHUNK_SIZE = 64 * 1024  # 64 KB for streaming
 
 
 def _course_to_response(c):
+    archived_at = c.archived_at
+    if archived_at is not None and archived_at.tzinfo is None:
+        archived_at = archived_at.replace(tzinfo=timezone.utc)
     return CourseResponse(
         id=str(c.id),
         title=c.title,
@@ -90,6 +100,8 @@ def _course_to_response(c):
         description=c.description,
         thumbnailEmoji=c.thumbnail_emoji,
         color=c.color,
+        archivedAt=archived_at.isoformat() if archived_at else None,
+        syllabusName=c.syllabus_name,
     )
 
 
@@ -212,6 +224,7 @@ async def search(
                 id=str(m.id),
                 title=m.title,
                 subtitle=m.type or "",
+                courseId=str(m.course_id),
                 link=(
                     f"/courses/{m.course_id}/materials/{m.id}/file"
                     if _uploads_filename_from_url(m.url or "")
@@ -236,14 +249,15 @@ async def list_courses(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
     pagination: Annotated[PaginationParams, Depends(get_pagination)],
+    archived: bool | None = None,
 ):
     """List courses. Admins see all; teachers see only their own courses; students see only enrolled courses."""
     if user.role == "admin":
-        courses, total = await course_service.list_courses(db, limit=pagination.limit, offset=pagination.offset)
+        courses, total = await course_service.list_courses(db, limit=pagination.limit, offset=pagination.offset, archived=archived)
     elif user.role == "teacher":
-        courses, total = await course_service.list_owned_courses(db, owner_id=user.id, limit=pagination.limit, offset=pagination.offset)
+        courses, total = await course_service.list_owned_courses(db, owner_id=user.id, limit=pagination.limit, offset=pagination.offset, archived=archived)
     else:
-        courses, total = await course_service.list_enrolled_courses(db, user.id, limit=pagination.limit, offset=pagination.offset)
+        courses, total = await course_service.list_enrolled_courses(db, user.id, limit=pagination.limit, offset=pagination.offset, archived=archived)
     return PaginatedResponse(
         items=[_course_to_response(c) for c in courses],
         total=total,
@@ -268,7 +282,7 @@ async def my_invites(
         if await course_service.get_enrollment(db, user.id, invite.course_id):
             continue  # already joined another way (class code)
         course = await course_service.get_course(db, invite.course_id)
-        if not course:
+        if not course or course.archived_at:
             continue
         out.append(
             MyInviteItem(
@@ -438,6 +452,59 @@ async def update_course(
     return _course_to_response(course)
 
 
+@router.put("/{course_id}/archive", response_model=CourseResponse)
+async def set_course_archive(
+    course_id: int, body: CourseArchiveUpdate,
+    user: Annotated[User, Depends(get_current_user)], db: Annotated[AsyncSession, Depends(get_db)],
+):
+    course = await _owned_course(db, user, course_id, lock=True)
+    if body.archived and not course.archived_at:
+        course.archived_at = datetime.now(timezone.utc)
+    elif not body.archived:
+        course.archived_at = None
+    response = _course_to_response(course)
+    await db.commit()
+    return response
+
+
+@router.put("/{course_id}/syllabus", response_model=CourseResponse)
+async def upload_syllabus(
+    course_id: int, file: Annotated[UploadFile, File()],
+    user: Annotated[User, Depends(get_current_user)], db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await _owned_course(db, user, course_id)
+    filename = Path((file.filename or "").replace("\\", "/")).name
+    if Path(filename).suffix.lower() != ".pdf" or len(filename) > 255:
+        raise ValidationError("Choose a syllabus PDF with a file name of 255 characters or fewer.", details=None)
+    size_limit = _MAX_UPLOAD_MB * 1024 * 1024
+    content = await file.read(size_limit + 1)
+    if len(content) > size_limit:
+        raise ValidationError(f"Syllabus PDFs can be up to {_MAX_UPLOAD_MB} MB.", details=None)
+    if not content.startswith(b"%PDF-"):
+        raise ValidationError("The syllabus file must be a PDF.", details=None)
+    course = await _owned_course(db, user, course_id, lock=True)
+    course.syllabus_name = filename
+    course.syllabus_pdf = content
+    response = _course_to_response(course)
+    await db.commit()
+    return response
+
+
+@router.get("/{course_id}/syllabus")
+async def download_syllabus(
+    course_id: int, user: Annotated[User, Depends(get_current_user)], db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await _course_for_member(db, user, course_id)
+    syllabus = (await db.execute(select(Course.syllabus_name, Course.syllabus_pdf).where(Course.id == course_id))).one_or_none()
+    if syllabus is None or not syllabus.syllabus_pdf or not syllabus.syllabus_name:
+        raise NotFoundError("No syllabus has been uploaded.", details=None)
+    return Response(syllabus.syllabus_pdf, media_type="application/pdf", headers={
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(syllabus.syllabus_name, safe='')}",
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
 @router.delete("/{course_id}", status_code=204)
 async def delete_course(
     course_id: int,
@@ -463,7 +530,7 @@ async def enroll(
             "Students must join a course via an invite link. Ask your teacher for an invite.",
             details=None,
         )
-    course = await course_service.get_course(db, course_id)
+    course = await course_service.get_course(db, course_id, lock=True)
     if not course:
         raise NotFoundError("Course not found.", details=None)
     existing = await course_service.get_enrollment(db, user.id, course_id)
@@ -474,6 +541,8 @@ async def enroll(
             progressPercent=existing.progress_percent,
             lastAccessedAt=existing.last_accessed_at.isoformat() if existing.last_accessed_at else None,
         )
+    if course.archived_at:
+        raise ValidationError("This course is archived and closed to new enrollments.", details=None)
     enrollment = await course_service.enroll(db, user.id, course_id)
     await db.commit()
     return EnrollmentResponse(
@@ -495,11 +564,13 @@ async def invite_student(
     """Send an invite for a student to join this course (teacher/admin only)."""
     if user.role not in ("admin", "teacher"):
         raise ForbiddenError("Only teachers and admins can send invites.", details=None)
-    course = await course_service.get_course(db, course_id)
+    course = await course_service.get_course(db, course_id, lock=True)
     if not course:
         raise NotFoundError("Course not found.", details=None)
     if user.role != "admin" and course.owner_id != user.id:
         raise ForbiddenError("You can only manage invites for your own courses.", details=None)
+    if course.archived_at:
+        raise ValidationError("Restore the course before sending invitations.", details=None)
     invite = await course_service.create_invite(
         db, course_id=course_id, invited_by=user.id, email=body.email
     )
@@ -1116,24 +1187,24 @@ async def get_material_file(
             headers={"Content-Range": f"bytes */{file_size}"},
         )
 
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": content_disp,
+        "X-Document-Version": _document_version(material),
+    }
     if use_range:
         content_length = end - start + 1
-        headers = {
+        headers.update({
             "Content-Range": f"bytes {start}-{end}/{file_size}",
             "Content-Length": str(content_length),
-            "Accept-Ranges": "bytes",
-            "Content-Disposition": content_disp,
-        }
+        })
         return StreamingResponse(
             _stream_file_chunks(file_path, start, end),
             status_code=206,
             media_type=media_type,
             headers=headers,
         )
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Disposition": content_disp,
-    }
+    headers["Content-Length"] = str(file_size)
     return StreamingResponse(
         _stream_file_chunks(file_path, 0, file_size - 1),
         status_code=200,
@@ -1142,10 +1213,84 @@ async def get_material_file(
     )
 
 
+def _document_version(material: Material) -> str:
+    # The upload handler assigns a new immutable storage name to every replacement.
+    return sha256(material.url.encode("utf-8")).hexdigest()
+
+
+async def _annotation_material(db: AsyncSession, user: User, course_id: int, material_id: int, *, lock: bool = False):
+    await _course_for_member(db, user, course_id)
+    query = select(Material).where(Material.id == material_id, Material.course_id == course_id)
+    material = await db.scalar(query.with_for_update() if lock else query)
+    filename = _uploads_filename_from_url(material.url) if material else None
+    if not material or not filename or Path(filename).suffix.lower() != ".pdf":
+        raise NotFoundError("Course PDF not found.", details=None)
+    return material
+
+
+def _annotation_response(annotation: MaterialAnnotation) -> MaterialAnnotationResponse:
+    return MaterialAnnotationResponse(
+        id=str(annotation.id), documentVersion=annotation.document_version, page=annotation.page,
+        quote=annotation.quote, note=annotation.note, rectangles=annotation.rectangles,
+    )
+
+
+@router.get("/{course_id}/materials/{material_id}/annotations", response_model=list[MaterialAnnotationResponse])
+async def list_material_annotations(
+    course_id: int, material_id: int,
+    user: Annotated[User, Depends(get_current_user)], db: Annotated[AsyncSession, Depends(get_db)],
+):
+    material = await _annotation_material(db, user, course_id, material_id)
+    rows = await db.scalars(select(MaterialAnnotation).where(
+        MaterialAnnotation.user_id == user.id, MaterialAnnotation.material_id == material.id,
+        MaterialAnnotation.document_version == _document_version(material),
+    ).order_by(MaterialAnnotation.page, MaterialAnnotation.id))
+    return [_annotation_response(row) for row in rows]
+
+
+@router.post("/{course_id}/materials/{material_id}/annotations", response_model=MaterialAnnotationResponse, status_code=201)
+async def create_material_annotation(
+    course_id: int, material_id: int, body: MaterialAnnotationCreate,
+    user: Annotated[User, Depends(get_current_user)], db: Annotated[AsyncSession, Depends(get_db)],
+):
+    material = await _annotation_material(db, user, course_id, material_id, lock=True)
+    version = _document_version(material)
+    if version != body.documentVersion:
+        raise ValidationError("This PDF was replaced. Reopen it before saving a highlight.", details=None)
+    quote = body.quote.strip()
+    if not quote:
+        raise ValidationError("Select text to highlight.", details=None)
+    annotation = MaterialAnnotation(
+        user_id=user.id, material_id=material.id, document_version=version, page=body.page,
+        quote=quote, note=body.note.strip(), rectangles=[rect.model_dump() for rect in body.rectangles],
+    )
+    db.add(annotation)
+    await db.flush()
+    response = _annotation_response(annotation)
+    await db.commit()
+    return response
+
+
+@router.delete("/{course_id}/materials/{material_id}/annotations/{annotation_id}", status_code=204)
+async def delete_material_annotation(
+    course_id: int, material_id: int, annotation_id: int,
+    user: Annotated[User, Depends(get_current_user)], db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await _annotation_material(db, user, course_id, material_id)
+    annotation = await db.scalar(select(MaterialAnnotation).where(
+        MaterialAnnotation.id == annotation_id, MaterialAnnotation.material_id == material_id,
+        MaterialAnnotation.user_id == user.id,
+    ))
+    if annotation is None:
+        raise NotFoundError("Highlight not found.", details=None)
+    await db.delete(annotation)
+    await db.commit()
+
+
 # ----- Stream -----
-async def _course_for_member(db: AsyncSession, user: User, course_id: int):
+async def _course_for_member(db: AsyncSession, user: User, course_id: int, *, lock: bool = False):
     """Course if the user may read its content (owner, admin or enrolled student); else 404/403."""
-    course = await course_service.get_course(db, course_id)
+    course = await course_service.get_course(db, course_id, lock=lock)
     if not course:
         raise NotFoundError("Course not found.", details=None)
     if user.role == "admin" or course.owner_id == user.id:
@@ -1160,9 +1305,9 @@ def _require_course_owner(user: User, course) -> None:
         raise ForbiddenError("Only the course teacher can make this change.", details=None)
 
 
-async def _owned_course(db: AsyncSession, user: User, course_id: int):
+async def _owned_course(db: AsyncSession, user: User, course_id: int, *, lock: bool = False):
     """Course if the user is its teacher or an admin; else 404/403."""
-    course = await course_service.get_course(db, course_id)
+    course = await course_service.get_course(db, course_id, lock=lock)
     if not course:
         raise NotFoundError("Course not found.", details=None)
     _require_course_owner(user, course)
@@ -1375,11 +1520,55 @@ async def upload_file(
 # ----- Course modules (Classwork topics) -----
 # Items (materials, assignments, videos, quizzes) link to a module by its title in their `topic`.
 
-_TOPIC_COLUMNS = ((Material, Material.topic), (Assignment, Assignment.topic), (Video, Video.topic), (Quiz, Quiz.topic))
+_TOPIC_COLUMNS = (
+    (Material, Material.topic), (Assignment, Assignment.topic), (Video, Video.topic), (Quiz, Quiz.topic),
+    (CodeProblem, CodeProblem.topic),
+)
 
 
-def _module_to_response(m) -> ModuleResponse:
-    return ModuleResponse(id=str(m.id), courseId=str(m.course_id), title=m.title, sortOrder=m.sort_order)
+def _module_to_response(m: CourseModule, prerequisites: list[int] | tuple[int, ...] = ()) -> ModuleResponse:
+    return ModuleResponse(
+        id=str(m.id), courseId=str(m.course_id), title=m.title, sortOrder=m.sort_order,
+        prerequisiteIds=[str(item) for item in prerequisites],
+    )
+
+
+async def _prerequisite_graph(db: AsyncSession, course_id: int) -> dict[int, list[int]]:
+    rows = await db.execute(
+        select(ModulePrerequisite.module_id, ModulePrerequisite.prerequisite_id)
+        .join(CourseModule, CourseModule.id == ModulePrerequisite.module_id)
+        .where(CourseModule.course_id == course_id)
+        .order_by(ModulePrerequisite.prerequisite_id)
+    )
+    graph: dict[int, list[int]] = {}
+    for module_id, prerequisite_id in rows:
+        graph.setdefault(module_id, []).append(prerequisite_id)
+    return graph
+
+
+async def _set_prerequisites(db: AsyncSession, course_id: int, module_id: int, requested: list[int], graph: dict[int, list[int]]) -> list[int]:
+    ids = set(requested)
+    known = set(await db.scalars(select(CourseModule.id).where(CourseModule.course_id == course_id)))
+    if not ids <= known:
+        raise ValidationError("Prerequisite topics must belong to this course.", details=None)
+    seen: set[int] = set()
+    pending = list(ids)
+    while pending:
+        current = pending.pop()
+        if current == module_id:
+            raise ValidationError("These prerequisites create a circular dependency.", details=None)
+        if current not in seen:
+            seen.add(current)
+            pending.extend(graph.get(current, []))
+
+    existing = set(graph.get(module_id, []))
+    removed = existing - ids
+    if removed:
+        await db.execute(delete(ModulePrerequisite).where(
+            ModulePrerequisite.module_id == module_id, ModulePrerequisite.prerequisite_id.in_(removed),
+        ))
+    db.add_all(ModulePrerequisite(module_id=module_id, prerequisite_id=item) for item in ids - existing)
+    return sorted(ids)
 
 
 def _bookmark_to_response(b) -> BookmarkResponse:
@@ -1408,7 +1597,7 @@ async def list_modules(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Course topics in order. Topics used by items but not saved yet are added first."""
-    await _course_for_member(db, user, course_id)
+    await _course_for_member(db, user, course_id, lock=True)
     modules = list((await db.execute(
         select(CourseModule).where(CourseModule.course_id == course_id).order_by(CourseModule.sort_order, CourseModule.id)
     )).scalars().all())
@@ -1418,6 +1607,7 @@ async def list_modules(
     for model, column in _TOPIC_COLUMNS:
         rows = await db.execute(select(column).where(model.course_id == course_id, column.is_not(None)).distinct())
         used += [t for (t,) in rows.all() if t and t != "No topic" and t not in known and t not in used]
+    graph = await _prerequisite_graph(db, course_id)
     if used:
         next_order = (modules[-1].sort_order + 1) if modules else 0
         for i, title in enumerate(used):
@@ -1425,7 +1615,7 @@ async def list_modules(
             db.add(m)
             modules.append(m)
         await db.commit()
-    return [_module_to_response(m) for m in modules]
+    return [_module_to_response(m, graph.get(m.id, [])) for m in modules]
 
 
 @router.post("/{course_id}/modules", response_model=ModuleResponse, status_code=status.HTTP_201_CREATED)
@@ -1436,8 +1626,10 @@ async def create_module(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Add a topic at the end (course teacher only)."""
-    await _owned_course(db, user, course_id)
+    await _owned_course(db, user, course_id, lock=True)
     title = body.title.strip()
+    if not title:
+        raise ValidationError("Enter a topic name.", details=None)
     existing = (await db.execute(select(CourseModule).where(CourseModule.course_id == course_id))).scalars().all()
     if any(m.title.lower() == title.lower() for m in existing) or title == "No topic":
         raise ValidationError("A topic with this name already exists.", details=None)
@@ -1448,6 +1640,25 @@ async def create_module(
     return _module_to_response(m)
 
 
+@router.put("/{course_id}/modules/order", response_model=list[ModuleResponse])
+async def set_module_order(
+    course_id: int, body: ModuleOrderUpdate,
+    user: Annotated[User, Depends(get_current_user)], db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await _owned_course(db, user, course_id, lock=True)
+    modules = {item.id: item for item in await db.scalars(select(CourseModule).where(CourseModule.course_id == course_id))}
+    if len(body.moduleIds) != len(modules) or set(body.moduleIds) != set(modules):
+        raise ValidationError("Refresh Classwork and order all topics in this course.", details=None)
+    graph = await _prerequisite_graph(db, course_id)
+    response = []
+    for position, module_id in enumerate(body.moduleIds):
+        module = modules[module_id]
+        module.sort_order = position
+        response.append(_module_to_response(module, graph.get(module_id, [])))
+    await db.commit()
+    return response
+
+
 @router.patch("/{course_id}/modules/{module_id}", response_model=ModuleResponse)
 async def update_module(
     course_id: int,
@@ -1456,11 +1667,17 @@ async def update_module(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Rename a topic (its items move with it) or change its position (course teacher only)."""
-    await _owned_course(db, user, course_id)
+    """Rename, reorder, or set prerequisite topics."""
+    await _owned_course(db, user, course_id, lock=True)
     m = await _get_module(db, course_id, module_id)
+    graph = await _prerequisite_graph(db, course_id)
+    prerequisites = graph.get(module_id, [])
+    if body.prerequisiteIds is not None:
+        prerequisites = await _set_prerequisites(db, course_id, module_id, body.prerequisiteIds, graph)
     if body.title is not None and body.title.strip() != m.title:
         title = body.title.strip()
+        if not title:
+            raise ValidationError("Enter a topic name.", details=None)
         others = (await db.execute(
             select(CourseModule).where(CourseModule.course_id == course_id, CourseModule.id != module_id)
         )).scalars().all()
@@ -1472,7 +1689,7 @@ async def update_module(
         m.sort_order = body.sortOrder
     await db.commit()
     await db.refresh(m)
-    return _module_to_response(m)
+    return _module_to_response(m, prerequisites)
 
 
 @router.delete("/{course_id}/modules/{module_id}", status_code=204)
@@ -1483,9 +1700,12 @@ async def delete_module(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Delete a topic. Its items stay in the course under "No topic" (course teacher only)."""
-    await _owned_course(db, user, course_id)
+    await _owned_course(db, user, course_id, lock=True)
     m = await _get_module(db, course_id, module_id)
     await _set_items_topic(db, course_id, m.title, None)
+    await db.execute(delete(ModulePrerequisite).where(or_(
+        ModulePrerequisite.module_id == module_id, ModulePrerequisite.prerequisite_id == module_id,
+    )))
     await db.delete(m)
     await db.commit()
 

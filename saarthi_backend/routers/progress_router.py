@@ -8,10 +8,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from saarthi_backend.deps import get_current_user, get_db
 from saarthi_backend.model import User
-from saarthi_backend.service import progress_service
+from saarthi_backend.schema.activity_schemas import ResourceActivityRequest
+from saarthi_backend.service import activity_service, progress_service
 from saarthi_backend.utils.exceptions import ForbiddenError, NotFoundError
 
 router = APIRouter(prefix="/progress", tags=["progress"])
+
+
+@router.post("/activity", status_code=204)
+async def record_activity(
+    body: ResourceActivityRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Response:
+    await activity_service.record_resource_activity(db, user, body)
+    return Response(status_code=204)
 
 
 @router.get("/me")
@@ -50,7 +61,11 @@ async def class_performance(
     if course is None:
         return {"courses": listing, "performance": None}
     t = threshold if threshold is not None else progress_service.at_risk_threshold()
-    return {"courses": listing, "performance": await progress_service.class_performance(db, course, t)}
+    performance = await progress_service.class_performance(db, course, t)
+    performance["readership"] = await progress_service.course_readership(
+        db, course.id, [int(student["id"]) for student in performance["students"]],
+    )
+    return {"courses": listing, "performance": performance}
 
 
 @router.get("/class/export")

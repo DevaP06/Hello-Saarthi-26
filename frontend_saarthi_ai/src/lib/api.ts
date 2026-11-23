@@ -113,6 +113,8 @@ export interface CourseResponse {
   description?: string;
   thumbnailEmoji?: string;
   color?: string;
+  archivedAt?: string | null;
+  syllabusName?: string | null;
 }
 
 export interface EnrollmentWithCourseResponse {
@@ -198,6 +200,7 @@ export interface ModuleResponse {
   courseId: string;
   title: string;
   sortOrder: number;
+  prerequisiteIds: string[];
 }
 
 export interface BookmarkResponse {
@@ -222,6 +225,13 @@ export interface CodeProblemResponse {
   topics?: string | null;
   sortOrder: number;
   testCases: { input?: string | null; expectedOutput?: string | null; hidden: boolean }[];
+  /** null = practice problem every user sees. */
+  courseId?: number | null;
+  courseTitle?: string | null;
+  /** The lesson (Classwork topic) within the course. */
+  topic?: string | null;
+  /** True for the course's teacher (and admins); they also get hidden test cases in full. */
+  canEdit: boolean;
 }
 
 export interface CodeSubmitResponse {
@@ -272,6 +282,7 @@ export interface CoursePersonResponse {
 }
 
 export interface SearchItem {
+  courseId?: string | null;
   type: string;
   id: string;
   title: string;
@@ -284,6 +295,26 @@ export interface ConversationResponse {
   title: string;
   createdAt: string;
   updatedAt: string;
+  courseId?: number | null;
+}
+
+export interface ChatCitation {
+  number?: number | null;
+  source_file: string;
+  page_number?: number | string | null;
+  course_id?: number | null;
+  material_id?: number | null;
+  video_id?: number | null;
+  start_sec?: number | null;
+}
+
+export interface ChatAnswerMetadata {
+  socratic?: 'hint' | 'reveal' | 'off';
+  confidence?: 'ok' | 'low' | null;
+  confidence_reasons?: string[];
+  reply_mode?: string | null;
+  citations?: ChatCitation[];
+  cap?: { near: boolean; over: boolean } | null;
 }
 
 export interface ChatMessageItemResponse {
@@ -291,13 +322,15 @@ export interface ChatMessageItemResponse {
   role: 'user' | 'assistant';
   content: string;
   createdAt: string;
+  /** The student's thumbs up/down on an answer. */
+  rating?: 'up' | 'down' | null;
+  courseId?: number | null;
+  topic?: string | null;
+  replyToId?: number | null;
+  answerMetadata?: ChatAnswerMetadata | null;
 }
 
-export interface ConversationDetailResponse {
-  id: string;
-  title: string;
-  createdAt: string;
-  updatedAt: string;
+export interface ConversationDetailResponse extends ConversationResponse {
   messages: ChatMessageItemResponse[];
 }
 

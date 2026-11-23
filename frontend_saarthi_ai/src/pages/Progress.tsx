@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
-    Award, BarChart3, BookOpen, Calendar, CheckCircle2, Circle, Code2, Flame, Lightbulb, Lock, Target,
+    Award, BarChart3, BookOpen, Calendar, CheckCircle2, Code2, Download, Flame, Lightbulb, Lock, Target,
     TerminalSquare, TrendingUp, TriangleAlert, Trophy, Users,
 } from 'lucide-react';
 import './Progress.css';
 import { api } from '../lib/api';
+import { formatStudyTime } from '../lib/utils';
+import { resourceLink } from '../lib/resourceLinks';
 import { useAuthStore } from '../stores/auth.store';
 import TeacherAnalytics from './TeacherAnalytics';
 
@@ -17,7 +19,8 @@ interface WeakTopic extends TopicStat {
 interface CourseProgress {
     id: string; title: string; code: string;
     myAvg: number | null; classMedian: number | null; classmates: number; attempts: number;
-    modules: { title: string; covered: boolean }[]; coverage: number | null;
+    modules: { title: string; covered: boolean; completed: number; total: number; studySeconds: number }[];
+    coverage: number | null; estimatedCompletionDate: string | null;
 }
 interface StudentAnalytics {
     summary: {
@@ -32,6 +35,10 @@ interface StudentAnalytics {
     badges: { id: string; title: string; description: string; earned: boolean }[];
     recent: { type: 'quiz' | 'code'; title: string; at: string }[];
     nextResource: { reason: string; title: string; type: string; id: string | null; courseId: string } | null;
+    monthly: {
+        month: string; studySeconds: number; materialOpens: number; videoOpens: number;
+        activeDays: number; quizAttempts: number; avgQuizScore: number | null; codeSubmissions: number;
+    };
 }
 
 const pct = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `${Math.round(v)}%`);
@@ -67,7 +74,7 @@ function StudentProgress() {
     if (error) return <div className="progress-page"><p role="alert">{error}</p></div>;
     if (!data) return <div className="progress-page"><p>Loading…</p></div>;
 
-    const { summary, topics, difficulty, weakTopics, courses, badges, recent, nextResource } = data;
+    const { summary, topics, difficulty, weakTopics, courses, badges, recent, nextResource, monthly } = data;
     const trend = data.trend.slice(-range);
     const stats = [
         { icon: BookOpen, label: 'Courses', val: summary.courses, color: '#8FA3C2' },
@@ -79,9 +86,14 @@ function StudentProgress() {
     const noQuizzes = summary.attempts === 0;
 
     return (
-        <div className="progress-page">
+        <div className="progress-page student-progress">
             <div className="progress-header animate-fade-in">
-                <h1>Learning Analytics</h1>
+                <div className="progress-section-head">
+                    <h1>Learning Analytics</h1>
+                    <button type="button" className="btn btn-secondary btn-sm progress-print-hide" onClick={() => window.print()}>
+                        <Download size={14} /> Save as PDF
+                    </button>
+                </div>
                 <p>Your progress from quizzes, Code Lab and study activity</p>
             </div>
 
@@ -103,7 +115,9 @@ function StudentProgress() {
                     </div>
                     <Link
                         className="btn btn-primary btn-sm"
-                        to={nextResource.type === 'quiz' ? '/quiz' : `/courses/${nextResource.courseId}`}
+                        to={nextResource.type === 'quiz' ? '/quiz' : resourceLink({
+                            courseId: nextResource.courseId, materialId: nextResource.id,
+                        }) ?? `/courses/${nextResource.courseId}?tab=classwork`}
                     >
                         {nextResource.type === 'quiz' ? 'Practise' : 'Open notes'}
                     </Link>
@@ -181,6 +195,7 @@ function StudentProgress() {
             {/* Topic accuracy */}
             <div className="progress-section animate-fade-in delay-300" style={{ marginBottom: '1.5rem' }}>
                 <h3><Target size={18} /> Accuracy by Topic</h3>
+                <p className="progress-activity-time">Quiz answers and Code Lab test cases</p>
                 {topics.length === 0 ? (
                     <p className="progress-activity-time">No answered questions yet.</p>
                 ) : (
@@ -235,6 +250,9 @@ function StudentProgress() {
                                         <span className="progress-weak-pct">{pct(w.accuracy)}</span>
                                     </div>
                                     <div className="progress-weak-links">
+                                        <Link to={`/quiz?${new URLSearchParams({ review: '1', course: w.courseId, topic: w.topic })}`} className="progress-weak-link">
+                                            <Target size={13} /> Review this topic
+                                        </Link>
                                         {w.materials.map((m) => (
                                             <Link key={m.id} to={`/courses/${m.courseId}`} className="progress-weak-link">
                                                 <BookOpen size={13} /> {m.title}
@@ -289,9 +307,20 @@ function StudentProgress() {
                                 </div>
                                 <div className="progress-modules">
                                     {c.modules.map((m) => (
-                                        <span key={m.title} className={`progress-module ${m.covered ? 'covered' : 'uncovered'}`}>
-                                            {m.covered ? <CheckCircle2 size={12} /> : <Circle size={12} />} {m.title}
-                                        </span>
+                                        <div key={m.title} className="progress-module-row">
+                                            <div>
+                                                <span className={`progress-module ${m.covered ? 'covered' : 'uncovered'}`}>{m.title}</span>
+                                                {!m.covered && m.total > 0 && (
+                                                    <Link className="progress-weak-link" to={`/courses/${c.id}?tab=classwork`}>Start in Classwork</Link>
+                                                )}
+                                            </div>
+                                            {m.total > 0 && (
+                                                <progress value={m.completed} max={m.total} aria-label={`${m.title} completion`} />
+                                            )}
+                                            <span className="progress-activity-time">
+                                                {m.completed}/{m.total} items · {formatStudyTime(m.studySeconds)} active study
+                                            </span>
+                                        </div>
                                     ))}
                                     {c.modules.length === 0 && <span className="progress-activity-time">No modules yet.</span>}
                                 </div>
@@ -299,11 +328,31 @@ function StudentProgress() {
                                     <span><Target size={12} /> Your average: {pct(c.myAvg)}</span>
                                     <span><Users size={12} /> Class median: {pct(c.classMedian)} ({c.classmates} student{c.classmates === 1 ? '' : 's'} with scores)</span>
                                 </div>
+                                {c.estimatedCompletionDate && (
+                                    <span className="progress-activity-time">
+                                        Estimated completion {new Date(c.estimatedCompletionDate).toLocaleDateString(undefined, { dateStyle: 'medium', timeZone: 'UTC' })}
+                                    </span>
+                                )}
                             </div>
                         ))}
                     </div>
                 )}
             </div>
+            <section className="progress-section" aria-labelledby="monthly-report-title">
+                <h3 id="monthly-report-title"><Calendar size={18} /> Monthly Report Card</h3>
+                <p className="progress-activity-time">
+                    {new Date(monthly.month).toLocaleDateString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' })}
+                </p>
+                <dl className="progress-report-stats">
+                    <div><dt>Active days</dt><dd>{monthly.activeDays}</dd></div>
+                    <div><dt>Active study time</dt><dd>{formatStudyTime(monthly.studySeconds)}</dd></div>
+                    <div><dt>Materials opened</dt><dd>{monthly.materialOpens}</dd></div>
+                    <div><dt>Videos opened</dt><dd>{monthly.videoOpens}</dd></div>
+                    <div><dt>Quiz attempts</dt><dd>{monthly.quizAttempts}</dd></div>
+                    <div><dt>Average quiz score</dt><dd>{pct(monthly.avgQuizScore)}</dd></div>
+                    <div><dt>Code submissions</dt><dd>{monthly.codeSubmissions}</dd></div>
+                </dl>
+            </section>
         </div>
     );
 }

@@ -117,6 +117,17 @@
     cursor: pointer;
 }
 
+.an-source-row {
+    display: flex;
+    align-items: stretch;
+    gap: 0.4rem;
+}
+
+.an-source-row .an-source-head {
+    min-width: 0;
+    flex: 1;
+}
+
 .an-source-n {
     font-weight: 700;
     color: var(--primary);

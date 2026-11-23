@@ -3,7 +3,7 @@ from .context_model import Base
 from .user_model import RefreshToken, User
 from .course_model import Course, Enrollment, Assignment, AssignmentSubmission, Material, StreamItem, StreamComment, ClassroomInvite, CourseModule, Bookmark
 from .video_model import Video, VideoProgress, VideoNote
-from .quiz_model import Quiz, QuizQuestion, QuizAttempt
+from .quiz_model import Quiz, QuizQuestion, QuizAttempt, QuizPractice
 from .note_model import Note
 from .notification_model import Notification
 from .chat_model import Conversation, ChatMessage
@@ -11,6 +11,7 @@ from .code_problem_model import CodeProblem, CodeSubmission
 from .study_guide_model import StudyGuide, StudyGuidePrompt
 from .review_model import AnswerReview
 from .qa_review_model import QAReviewAction
+from .activity_model import ActivityEvent
 
 __all__ = [
     "Base",
@@ -32,6 +33,7 @@ __all__ = [
     "Quiz",
     "QuizQuestion",
     "QuizAttempt",
+    "QuizPractice",
     "Note",
     "Notification",
     "CodeProblem",
@@ -42,4 +44,5 @@ __all__ = [
     "StudyGuidePrompt",
     "AnswerReview",
     "QAReviewAction",
+    "ActivityEvent",
 ]

@@ -2,7 +2,8 @@
 concept graph, exam prediction."""
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+import re
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +35,23 @@ logger = logging.getLogger(__name__)
 from src.utils.llm import async_openai, chat_model_name
 
 
+_UNSCOPED_PORTION_REQUEST = re.compile(
+    r"(?:(?:can|could|would) you )?(?:please )?"
+    r"(?:(?:tell|show|give|list)(?: me)? |(?:what is|what's) )?"
+    r"(?:(?:the|my) )?(?:(?:whole|full|entire|complete|exam|course) )?"
+    r"(?:portion|syllabus|curriculum)"
+    r"(?: for (?:(?:the|my) )?(?:exam|test|class|course))?(?: please)?"
+)
+
+
+def portion_clarification(question: str) -> str | None:
+    """Ask for the subject of a syllabus request that names no scope."""
+    normalized = " ".join(question.lower().strip(" .?!,\r\n\t").split())
+    if _UNSCOPED_PORTION_REQUEST.fullmatch(normalized):
+        return "Which subject, exam, or module do you mean? For example, ‘DSP midterm’ or ‘Probability Module 1’."
+    return None
+
+
 def _clean(text: str | None, names: list[str] | None = None) -> str:
     """Strip student PII (name, email, phone, roll number) from free text before an LLM sees it."""
     from src.safety.guard import scrub_pii
@@ -51,16 +69,15 @@ def _kb_excerpts(query: str, course_id: int | None = None) -> str:
         return ""
 
 
-async def create_conversation(db: AsyncSession, user_id: int, title: str = "New Chat") -> Conversation:
-    return await ConversationDAO.create(db, user_id, title=title)
+async def create_conversation(db: AsyncSession, user_id: int, title: str = "New Chat", course_id: int | None = None) -> Conversation:
+    return await ConversationDAO.create(db, user_id, title=title, course_id=course_id)
 
 
 async def list_conversations(
-    db: AsyncSession, user_id: int, limit: int = 20, offset: int = 0
+    db: AsyncSession, user_id: int, limit: int = 20, offset: int = 0, *,
+    topic: str | None = None, on_date: date | None = None,
 ) -> tuple[list[Conversation], int]:
-    items = await ConversationDAO.list_by_user(db, user_id, limit=limit, offset=offset)
-    total = await ConversationDAO.count_by_user(db, user_id)
-    return items, total
+    return await ConversationDAO.list_by_user(db, user_id, limit=limit, offset=offset, topic=topic, on_date=on_date)
 
 
 async def get_conversation(
@@ -202,8 +219,7 @@ async def send_message(
     if not conv:
         return None
     existing = await ChatMessageDAO.list_by_conversation(db, conversation_id)
-    user_msg = await ChatMessageDAO.create(db, conversation_id, "user", message)
-    history = [{"role": m.role, "content": m.content} for m in existing]
+    history = [{"role": m.role, "content": m.content} for m in existing if m.course_id == course_id]
     # The signed-in student's own name is scrubbed too (a name typed without "my name is" is otherwise kept).
     from saarthi_backend.model import User
 
@@ -213,8 +229,21 @@ async def send_message(
     # Gemini knowledge-base path by default; the Saarthi AI core when CHAT_SOURCE=core (see _kb_chat_reply).
     # Either way the message and history are PII-scrubbed first.
     clean_message = _clean(message, names)
-    kb_reply = await _kb_chat_reply(clean_message, history)
-    if kb_reply is not None:
+    clarification = portion_clarification(clean_message) if course_id is None and not context_material_title else None
+    kb_reply = (clarification or await _kb_chat_reply(clean_message, history)) if course_id is None else None
+    from src.orchestrator.topics import topic_of
+
+    topic = "General" if course_id is not None or clarification else topic_of(clean_message)[:128]
+    shared_query = None
+    if course_id is not None:
+        from src.safety.guard import check_injection
+
+        if not check_injection(clean_message):
+            shared_query = " ".join(clean_message.split())[:2000]
+        assistant_content = await stateless_message(
+            clean_message, history, context_material_title=context_material_title, course_id=course_id,
+        )
+    elif kb_reply is not None:
         assistant_content = kb_reply
     else:
         prompt_for_ai, is_grounded = _apply_document_context(clean_message, context_material_title, course_id=course_id)
@@ -223,7 +252,10 @@ async def send_message(
             assistant_content = await run_document_chat(prompt_for_ai, history[:-1])
         else:
             assistant_content = await run_chat(prompt_for_ai, history, mind_mode=False)
-    assistant_msg = await ChatMessageDAO.create(db, conversation_id, "assistant", assistant_content)
+    user_msg = await ChatMessageDAO.create(db, conversation_id, "user", message, course_id=course_id,
+                                          topic=topic, shared_query=shared_query)
+    assistant_msg = await ChatMessageDAO.create(db, conversation_id, "assistant", assistant_content, course_id=course_id,
+                                               topic=topic, reply_to_id=user_msg.id)
     if len(existing) == 0:
         title = (message.strip()[:200] + "…") if len(message.strip()) > 200 else message.strip()
         await ConversationDAO.update_title(db, conversation_id, user_id, title or "New Chat")

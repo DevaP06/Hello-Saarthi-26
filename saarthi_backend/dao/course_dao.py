@@ -40,22 +40,31 @@ async def count_pending_assignments_for_user(db: AsyncSession, user_id: int) -> 
 
 class CourseDAO:
     @staticmethod
-    async def get_by_id(db: AsyncSession, course_id: int) -> Course | None:
-        result = await db.execute(select(Course).where(Course.id == course_id))
+    async def get_by_id(db: AsyncSession, course_id: int, *, lock: bool = False) -> Course | None:
+        query = select(Course).where(Course.id == course_id)
+        if lock:
+            query = query.with_for_update().execution_options(populate_existing=True)
+        result = await db.execute(query)
         return result.scalar_one_or_none()
 
     @staticmethod
+    def archive_filter(archived: bool | None):
+        if archived is None:
+            return ()
+        return (Course.archived_at.is_not(None) if archived else Course.archived_at.is_(None),)
+
+    @staticmethod
     async def list_all(
-        db: AsyncSession, limit: int = 100, offset: int = 0
+        db: AsyncSession, limit: int = 100, offset: int = 0, *, archived: bool | None = None,
     ) -> list[Course]:
         result = await db.execute(
-            select(Course).order_by(Course.id).limit(limit).offset(offset)
+            select(Course).where(*CourseDAO.archive_filter(archived)).order_by(Course.id).limit(limit).offset(offset)
         )
         return list(result.scalars().all())
 
     @staticmethod
-    async def count_all(db: AsyncSession) -> int:
-        r = await db.execute(select(func.count()).select_from(Course))
+    async def count_all(db: AsyncSession, *, archived: bool | None = None) -> int:
+        r = await db.execute(select(func.count()).select_from(Course).where(*CourseDAO.archive_filter(archived)))
         return r.scalar() or 0
 
     @staticmethod
@@ -115,16 +124,17 @@ class CourseDAO:
 
     @staticmethod
     async def list_by_owner(
-        db: AsyncSession, owner_id: int, limit: int = 100, offset: int = 0
+        db: AsyncSession, owner_id: int, limit: int = 100, offset: int = 0, *, archived: bool | None = None,
     ) -> list[Course]:
         result = await db.execute(
-            select(Course).where(Course.owner_id == owner_id).order_by(Course.id).limit(limit).offset(offset)
+            select(Course).where(Course.owner_id == owner_id, *CourseDAO.archive_filter(archived))
+            .order_by(Course.id).limit(limit).offset(offset)
         )
         return list(result.scalars().all())
 
     @staticmethod
-    async def count_by_owner(db: AsyncSession, owner_id: int) -> int:
-        r = await db.execute(select(func.count()).select_from(Course).where(Course.owner_id == owner_id))
+    async def count_by_owner(db: AsyncSession, owner_id: int, *, archived: bool | None = None) -> int:
+        r = await db.execute(select(func.count()).select_from(Course).where(Course.owner_id == owner_id, *CourseDAO.archive_filter(archived)))
         return r.scalar() or 0
 
     @staticmethod
@@ -614,19 +624,20 @@ async def search(
 # ----- Scoped course listing for students -----
 
 async def list_courses_for_student(
-    db: AsyncSession, user_id: int, limit: int = 100, offset: int = 0
+    db: AsyncSession, user_id: int, limit: int = 100, offset: int = 0, *, archived: bool | None = None,
 ) -> tuple[list[Course], int]:
     """Return only courses the student is enrolled in."""
     enrolled_subq = select(Enrollment.course_id).where(Enrollment.user_id == user_id)
+    filters = (Course.id.in_(enrolled_subq), *CourseDAO.archive_filter(archived))
     result = await db.execute(
         select(Course)
-        .where(Course.id.in_(enrolled_subq))
+        .where(*filters)
         .order_by(Course.id)
         .limit(limit)
         .offset(offset)
     )
     count_result = await db.execute(
-        select(func.count()).select_from(Course).where(Course.id.in_(enrolled_subq))
+        select(func.count()).select_from(Course).where(*filters)
     )
     return list(result.scalars().all()), count_result.scalar_one()
 

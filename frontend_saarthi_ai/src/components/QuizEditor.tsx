@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ListChecks, Plus, Trash2, X } from 'lucide-react';
+import { ListChecks, Loader2, Plus, Sparkles, Trash2, X } from 'lucide-react';
 import { api, type QuizDetailResponse, type QuizDifficulty } from '../lib/api';
 import { useToast } from './Toast';
 
@@ -23,6 +23,16 @@ const emptyQuestion = (topic: string): DraftQuestion => ({
     questionText: '', options: ['', '', '', ''], correctIndex: 0, topic, difficulty: 'recall', explanation: '',
 });
 
+// POST /quizzes/generate-grounded: questions written only from the course notes, each citing its excerpt.
+const LEVEL_CODE: Record<QuizDifficulty, string> = { recall: 'L1', application: 'L2', analysis: 'L3' };
+interface GeneratedMcqs {
+    questions: { question: string; options: string[]; answer_index: number; explanation: string; source: string }[];
+    not_covered?: boolean;
+    error?: string;
+}
+
+const isBlank = (q: DraftQuestion) => !q.questionText.trim() && q.options.every((o) => !o.trim());
+
 /** Teacher form: a quiz with multiple-choice questions, saved in one request. */
 export default function QuizEditor({ courseId, topics, onClose, onCreated }: Props) {
     const toast = useToast();
@@ -34,9 +44,49 @@ export default function QuizEditor({ courseId, topics, onClose, onCreated }: Pro
     const [questions, setQuestions] = useState<DraftQuestion[]>([emptyQuestion('')]);
     const [error, setError] = useState<string | null>(null);
     const [saving, setSaving] = useState(false);
+    const [genTopic, setGenTopic] = useState('');
+    const [genLevel, setGenLevel] = useState<QuizDifficulty>('recall');
+    const [genCount, setGenCount] = useState(5);
+    const [generating, setGenerating] = useState(false);
+    const [genNote, setGenNote] = useState<string | null>(null);
 
     const update = (i: number, change: Partial<DraftQuestion>) =>
         setQuestions((prev) => prev.map((q, j) => (j === i ? { ...q, ...change } : q)));
+
+    // Drafts from the notes: the teacher checks and edits them before posting.
+    const generate = async () => {
+        const t = genTopic.trim();
+        if (t.length < 2) { setError('Type a topic to generate questions about, e.g. "FFT".'); return; }
+        setGenerating(true);
+        setError(null);
+        setGenNote(null);
+        try {
+            const res = await api.post<GeneratedMcqs>('/quizzes/generate-grounded', {
+                courseId: Number(courseId), topic: t, numQuestions: genCount, level: LEVEL_CODE[genLevel],
+            });
+            if (!res.questions?.length) {
+                setGenNote(res.not_covered
+                    ? `The notes don't cover "${t}". Try a shorter topic name, e.g. "FFT" or "SVM".`
+                    : 'No usable questions came back. Try again.');
+                return;
+            }
+            const drafts: DraftQuestion[] = res.questions.map((q) => ({
+                questionText: q.question,
+                options: q.options.slice(0, 4),
+                correctIndex: q.answer_index,
+                topic: t,
+                difficulty: genLevel,
+                explanation: `${q.explanation} Source: ${q.source}`,
+            }));
+            setQuestions((prev) => [...prev.filter((q) => !isBlank(q)), ...drafts]);
+            if (!title.trim()) setTitle(`${t}: practice`);
+            setGenNote(`Added ${drafts.length} question${drafts.length === 1 ? '' : 's'} from the notes. Check each one before posting.`);
+        } catch (e) {
+            setError(e instanceof Error ? e.message : 'Could not generate questions');
+        } finally {
+            setGenerating(false);
+        }
+    };
 
     const save = async () => {
         setError(null);
@@ -111,6 +161,25 @@ export default function QuizEditor({ courseId, topics, onClose, onCreated }: Pro
                             <label>Pass mark (%)</label>
                             <input className="input" type="number" min={0} max={100} value={passing} onChange={(e) => setPassing(Math.min(100, Math.max(0, parseInt(e.target.value) || 0)))} />
                         </div>
+                    </div>
+
+                    <div className="cd-quiz-generate">
+                        <h3><Sparkles size={15} /> Generate questions from the notes</h3>
+                        <div className="cd-quiz-generate-row">
+                            <input className="input" aria-label="Topic to generate questions about" placeholder="Topic, e.g. FFT" value={genTopic} onChange={(e) => setGenTopic(e.target.value)} maxLength={200} />
+                            <select className="input" aria-label="Question level" value={genLevel} onChange={(e) => setGenLevel(e.target.value as QuizDifficulty)}>
+                                <option value="recall">Recall</option>
+                                <option value="application">Application</option>
+                                <option value="analysis">Analysis</option>
+                            </select>
+                            <select className="input" aria-label="Number of questions" value={genCount} onChange={(e) => setGenCount(Number(e.target.value))}>
+                                {[3, 5, 8, 10].map((n) => <option key={n} value={n}>{n} questions</option>)}
+                            </select>
+                            <button type="button" className="btn btn-outline btn-sm" disabled={generating} onClick={generate}>
+                                {generating ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />} {generating ? 'Writing…' : 'Generate'}
+                            </button>
+                        </div>
+                        <p className="cd-quiz-hint">{genNote ?? 'Written only from the course notes; each explanation names its source page.'}</p>
                     </div>
 
                     {questions.map((q, i) => (

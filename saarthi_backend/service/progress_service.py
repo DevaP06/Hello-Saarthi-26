@@ -5,7 +5,7 @@ recommended materials, syllabus coverage, class median, streak and badges.
 Teacher view (WBS 4.2 student performance): score histogram, at-risk students,
 per-topic class accuracy, most-missed questions and a CSV export.
 
-No AI is involved. Everything is derived from rows that already exist.
+Metrics are derived from course work and student activity records.
 """
 
 from __future__ import annotations
@@ -18,11 +18,13 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from statistics import median
 
-from sqlalchemy import select
+from sqlalchemy import Date, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from saarthi_backend.dao.notification_dao import NotificationDAO
 from saarthi_backend.model import (
+    ActivityEvent,
+    Assignment,
     ChatMessage,
     CodeProblem,
     CodeSubmission,
@@ -35,7 +37,9 @@ from saarthi_backend.model import (
     QuizAttempt,
     QuizQuestion,
     User,
+    Video,
 )
+from saarthi_backend.service import activity_service
 
 WEAK_BELOW = 70.0  # a topic below this accuracy is "weak" for a student
 
@@ -102,9 +106,14 @@ def _graded_answers(attempt: QuizAttempt, quiz: Quiz, questions: dict[str, QuizQ
 # ── Streak ──────────────────────────────────────────────────────────────────
 
 async def active_days(db: AsyncSession, user_id: int, since_days: int = 400) -> set[date]:
-    """Days (UTC) on which the user submitted a quiz or code, or asked the AI tutor."""
+    """Days (UTC) with sign-in, resource use, submissions, or a question to the tutor."""
     since = datetime.now(timezone.utc) - timedelta(days=since_days)
-    days: set[date] = set()
+    event_day = (cast(func.timezone("UTC", ActivityEvent.created_at), Date)
+                 if db.get_bind().dialect.name == "postgresql" else func.date(ActivityEvent.created_at))
+    activity_days = await db.scalars(
+        select(event_day).where(ActivityEvent.user_id == user_id, ActivityEvent.created_at >= since).distinct()
+    )
+    days = {date.fromisoformat(value) if isinstance(value, str) else value for value in activity_days}
     for stmt in (
         select(QuizAttempt.submitted_at).where(QuizAttempt.user_id == user_id, QuizAttempt.submitted_at >= since),
         select(CodeSubmission.created_at).where(CodeSubmission.user_id == user_id, CodeSubmission.created_at >= since),
@@ -134,21 +143,25 @@ async def streak_days(db: AsyncSession, user_id: int) -> int:
 # ── Student analytics ───────────────────────────────────────────────────────
 
 async def _course_topics(db: AsyncSession, course_id: int) -> list[str]:
-    """Module titles in order, then topics used by quizzes and materials that have no module row."""
+    """Module titles in order, then topics used by course work without a module row."""
     mods = (await db.execute(
         select(CourseModule.title).where(CourseModule.course_id == course_id)
         .order_by(CourseModule.sort_order, CourseModule.id)
     )).scalars().all()
-    seen = {m.lower() for m in mods}
+    seen = {activity_service.topic_key(m) for m in mods}
     out = list(mods)
     for stmt in (
-        select(Quiz.topic).where(Quiz.course_id == course_id, Quiz.topic.is_not(None)),
-        select(Material.topic).where(Material.course_id == course_id, Material.topic.is_not(None)),
+        select(Quiz.topic).where(Quiz.course_id == course_id).distinct(),
+        select(Material.topic).where(Material.course_id == course_id).distinct(),
+        select(Video.topic).where(Video.course_id == course_id).distinct(),
+        select(Assignment.topic).where(Assignment.course_id == course_id).distinct(),
+        select(CodeProblem.topic).where(CodeProblem.course_id == course_id, CodeProblem.is_active.is_(True)).distinct(),
     ):
         for t in (await db.execute(stmt)).scalars().all():
-            if t and t.strip() and t.lower() not in seen:
-                seen.add(t.lower())
-                out.append(t)
+            key = activity_service.topic_key(t)
+            if key not in seen:
+                seen.add(key)
+                out.append((t or "").strip() or "General")
     return out
 
 
@@ -170,6 +183,11 @@ async def student_analytics(db: AsyncSession, user: User) -> dict:
 
     mine = await _attempts_with_quizzes(db, course_ids, user.id)
     questions = await _questions(db, {q.id for _, q in mine})
+    code_rows = (await db.execute(
+        select(CodeSubmission, CodeProblem)
+        .join(CodeProblem, CodeProblem.id == CodeSubmission.problem_id)
+        .where(CodeSubmission.user_id == user.id).order_by(CodeSubmission.created_at.desc())
+    )).all()
 
     # Per topic and per difficulty accuracy.
     topic_stats: dict[tuple[int, str], list[int]] = defaultdict(lambda: [0, 0])
@@ -180,6 +198,11 @@ async def student_analytics(db: AsyncSession, user: User) -> dict:
             topic_stats[(quiz.course_id, topic)][1] += 1
             diff_stats[q.difficulty or "recall"][0] += int(ok)
             diff_stats[q.difficulty or "recall"][1] += 1
+    for submission, problem in code_rows:
+        if problem.course_id in title and submission.total:
+            score = topic_stats[(problem.course_id, problem.topic or "General")]
+            score[0] += submission.passed
+            score[1] += submission.total
 
     topics = sorted(
         (
@@ -207,7 +230,8 @@ async def student_analytics(db: AsyncSession, user: User) -> dict:
         })
 
     # Trend: one point per day with attempts, last 30 days.
-    since = datetime.now(timezone.utc).date() - timedelta(days=29)
+    now = datetime.now(timezone.utc)
+    since = now.date() - timedelta(days=29)
     per_day: dict[date, list[float]] = defaultdict(list)
     for attempt, _ in mine:
         d = _day(attempt.submitted_at)
@@ -228,15 +252,33 @@ async def student_analytics(db: AsyncSession, user: User) -> dict:
         by_course_user[quiz.course_id][attempt.user_id].append(attempt.score)
     covered_topics: dict[int, set[str]] = defaultdict(set)
     for (cid, t) in topic_stats:
-        covered_topics[cid].add(t.lower())
+        covered_topics[cid].add(activity_service.topic_key(t))
     for _, quiz in mine:
         if quiz.topic:
-            covered_topics[quiz.course_id].add(quiz.topic.lower())
+            covered_topics[quiz.course_id].add(activity_service.topic_key(quiz.topic))
+
+    syllabus = await activity_service.syllabus_items(db, user.id, course_ids)
+    study_time = await activity_service.student_topic_activity(db, user.id, course_ids)
 
     course_out = []
     for c in courses:
         mods = await _course_topics(db, c.id)
-        modules = [{"title": m, "covered": m.lower() in covered_topics[c.id]} for m in mods]
+        modules = []
+        completion_dates = []
+        for name in mods:
+            key = activity_service.topic_key(name)
+            items = syllabus.get((c.id, key), [])
+            completed = [value for value in items if value is not None]
+            if items:
+                completion_dates.append(max(completed) if len(completed) == len(items) else None)
+            modules.append({
+                "title": name,
+                "covered": bool(completed) or key in covered_topics[c.id],
+                "completed": len(completed),
+                "total": len(items),
+                "studySeconds": study_time.get((c.id, key), 0),
+            })
+        total_items = sum(m["total"] for m in modules)
         avgs = [sum(s) / len(s) for s in by_course_user[c.id].values() if s]
         my_scores = by_course_user[c.id].get(user.id, [])
         course_out.append({
@@ -246,31 +288,26 @@ async def student_analytics(db: AsyncSession, user: User) -> dict:
             "classmates": len(avgs),
             "attempts": len(my_scores),
             "modules": modules,
-            "coverage": _r(sum(m["covered"] for m in modules) * 100 / len(modules)) if modules else None,
+            "coverage": _r(sum(m["completed"] for m in modules) * 100 / total_items) if total_items else None,
+            "estimatedCompletionDate": activity_service.estimated_finish(completion_dates, now),
         })
 
-    # Code submissions and activity.
-    code_rows = (await db.execute(
-        select(CodeSubmission, CodeProblem.title)
-        .join(CodeProblem, CodeProblem.id == CodeSubmission.problem_id)
-        .where(CodeSubmission.user_id == user.id).order_by(CodeSubmission.created_at.desc())
-    )).all()
     days = await active_days(db, user.id)
     streak = streak_from_days(days)
     scores = [a.score for a, _ in mine]
-    answered = sum(n for _, n in topic_stats.values())
-    correct = sum(c for c, _ in topic_stats.values())
+    answered = sum(n for _, n in diff_stats.values())
+    correct = sum(c for c, _ in diff_stats.values())
 
     recent = sorted(
         [{"type": "quiz", "title": f"Scored {round(a.score)}% on {q.title}", "at": a.submitted_at.isoformat()}
          for a, q in mine]
         + [{"type": "code",
-            "title": f"{'Solved' if s.total and s.passed == s.total else 'Submitted'}: {t} ({s.passed}/{s.total} tests)",
-            "at": s.created_at.isoformat()} for s, t in code_rows],
+            "title": f"{'Solved' if s.total and s.passed == s.total else 'Submitted'}: {problem.title} ({s.passed}/{s.total} tests)",
+            "at": s.created_at.isoformat()} for s, problem in code_rows],
         key=lambda x: x["at"], reverse=True,
     )[:8]
 
-    solved = {t for s, t in code_rows if s.total and s.passed == s.total}
+    solved = {problem.id for s, problem in code_rows if s.total and s.passed == s.total}
     badges = [
         {"id": "first-quiz", "title": "First Quiz", "description": "Submit your first quiz", "earned": len(scores) >= 1},
         {"id": "perfect", "title": "Perfect Score", "description": "Score 100% on a quiz", "earned": any(s >= 100 for s in scores)},
@@ -303,6 +340,16 @@ async def student_analytics(db: AsyncSession, user: User) -> dict:
                                                           "courseId": c["id"]})}
                 break
 
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_scores = [a.score for a, _ in mine if _day(a.submitted_at) >= month_start.date()]
+    monthly = await activity_service.monthly_activity(db, user.id, month_start)
+    monthly.update({
+        "month": month_start.date().isoformat(),
+        "activeDays": sum(d >= month_start.date() for d in days),
+        "quizAttempts": len(month_scores),
+        "avgQuizScore": _r(sum(month_scores) / len(month_scores)) if month_scores else None,
+        "codeSubmissions": sum(_day(s.created_at) >= month_start.date() for s, _ in code_rows),
+    })
     return {
         "summary": {
             "courses": len(courses),
@@ -326,6 +373,7 @@ async def student_analytics(db: AsyncSession, user: User) -> dict:
         "badges": badges,
         "recent": recent,
         "nextResource": next_resource,
+        "monthly": monthly,
     }
 
 
@@ -336,6 +384,12 @@ async def teacher_courses(db: AsyncSession, user: User) -> list[Course]:
     if user.role != "admin":
         stmt = stmt.where(Course.owner_id == user.id)
     return list((await db.execute(stmt)).scalars().all())
+
+
+async def course_readership(db: AsyncSession, course_id: int, student_ids: list[int]) -> dict:
+    return await activity_service.class_readership(
+        db, course_id, student_ids, await _course_topics(db, course_id), datetime.now(timezone.utc),
+    )
 
 
 async def class_performance(db: AsyncSession, course: Course, threshold: float) -> dict:

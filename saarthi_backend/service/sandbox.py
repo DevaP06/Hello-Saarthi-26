@@ -1,6 +1,11 @@
 """Code sandbox: Docker (no network, timeout, memory/pid caps) or local
 subprocess fallback — for EVERY supported language, not just Python.
 
+SANDBOX_URL=http://sandbox:8100 (production): the backend never runs code itself; it
+sends it to the separate sandbox container (sandbox_server.py), which has no secrets
+and no internet. Running student code in the backend process would let it read the
+backend's environment (database URL, API keys, JWT secret).
+
 CODE_SANDBOX=docker|local (default: docker if the daemon is reachable, else local)
 
 IMPORTANT: the default SANDBOX_IMAGE (python:3.12-slim) only has Python.
@@ -45,9 +50,11 @@ MEMORY = os.environ.get("SANDBOX_MEMORY", "512m")
 CPUS = os.environ.get("SANDBOX_CPUS", "0.5")
 PIDS_LIMIT = os.environ.get("SANDBOX_PIDS_LIMIT", "64")
 IMAGE = os.environ.get("SANDBOX_IMAGE", "python:3.12-slim")
+SANDBOX_URL = os.environ.get("SANDBOX_URL", "").strip().rstrip("/")
 
 _py = python_argv()
 _py_run_local = " ".join(_py) + " {src}"
+_OCTAVE_ARGS = ("--quiet", "--no-init-file", "--no-history")
 
 # Single source of truth for language config. code_service.py imports this
 # instead of keeping its own copy (that duplication is how Python ended up
@@ -55,6 +62,7 @@ _py_run_local = " ".join(_py) + " {src}"
 # {lang: (binary_for_local_check, compile_template | None, run_template)}
 LANG_CONFIG: dict[str, tuple[str, str | None, str]] = {
     "python":     (_py[0],   None,                          _py_run_local),
+    "matlab":     ("octave-cli", None,                      "octave-cli " + " ".join(_OCTAVE_ARGS) + " {src}"),
     "javascript": ("node",   None,                          "node {src}"),
     "cpp":        ("g++",    "g++ -O2 -o {out} {src}",       "{out}"),
     "c":          ("gcc",    "gcc -O2 -o {out} {src} -lm",   "{out}"),
@@ -66,7 +74,7 @@ LANG_CONFIG: dict[str, tuple[str, str | None, str]] = {
 }
 
 EXT: dict[str, str] = {
-    "python": "py", "javascript": "js", "cpp": "cpp", "c": "c",
+    "python": "py", "matlab": "m", "javascript": "js", "cpp": "cpp", "c": "c",
     "java": "java", "rust": "rs", "go": "go", "bash": "sh", "r": "r",
 }
 
@@ -91,6 +99,8 @@ def docker_available() -> bool:
 
 
 def mode() -> str:
+    if SANDBOX_URL:
+        return "remote"
     # Default LOCAL. Docker is up for Postgres on the eval laptop; if we
     # auto-pick docker, student Python runs in python:3.12-slim with no numpy
     # and Windows volume mounts often fail. Opt in with CODE_SANDBOX=docker.
@@ -126,6 +136,28 @@ def runtime_missing(language: str) -> str | None:
     return None
 
 
+def local_runtimes() -> list[dict]:
+    return [{"language": language, "runtime": binary, "available": runtime_missing(language) is None}
+            for language, (binary, _, _) in LANG_CONFIG.items()]
+
+
+def runtimes() -> list[dict]:
+    if SANDBOX_URL:
+        import json
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen(f"{SANDBOX_URL}/runtimes", timeout=4) as response:
+                return json.loads(response.read())["items"]
+        except (OSError, KeyError, ValueError):
+            logger.warning("Could not check the remote code runner runtimes", exc_info=True)
+            return []
+    if mode() == "docker":
+        return [{"language": language, "runtime": f"{binary} (Docker)", "available": True}
+                for language, (binary, _, _) in LANG_CONFIG.items()]
+    return local_runtimes()
+
+
 def _filename_for(language: str) -> str:
     ext = EXT.get(language, "txt")
     # Java requires filename == public class name.
@@ -138,16 +170,54 @@ def run_python(code: str, stdin: str = "") -> dict:
     return run_code("python", code, stdin)
 
 
+def _unsupported(language: str) -> dict:
+    return {
+        "stdout": "", "stderr": f"Language '{language}' is not supported.",
+        "exit_code": 1, "sandbox": "none", "language": language, "runtime": language,
+    }
+
+
 def run_code(language: str, code: str, stdin: str = "", timeout: int = TIMEOUT) -> dict:
-    """Run code in any supported language, routed through Docker when
-    CODE_SANDBOX permits it — the same isolation guarantee Python always had.
+    """Run code in any supported language: in the sandbox container when SANDBOX_URL is
+    set (production), otherwise on this machine (developer laptop).
     Returns {stdout, stderr, exit_code, sandbox, language, runtime}.
     """
     if language not in LANG_CONFIG:
+        return _unsupported(language)
+    if SANDBOX_URL:
+        return _remote(language, code, stdin, timeout)
+    return run_here(language, code, stdin, timeout)
+
+
+def _remote(language: str, code: str, stdin: str, timeout: int) -> dict:
+    """POST the code to the sandbox container. Never falls back to running it here."""
+    import json
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"{SANDBOX_URL}/run",
+        data=json.dumps({"language": language, "code": code, "stdin": stdin, "timeout": timeout}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        # Compiled languages get `timeout` for the build and again for the run.
+        with urllib.request.urlopen(req, timeout=2 * timeout + 15) as r:
+            result = json.loads(r.read())
+    except Exception as e:  # noqa: BLE001 - runner down, overloaded or restarting
+        logger.warning("Code sandbox unavailable at %s: %s", SANDBOX_URL, e)
         return {
-            "stdout": "", "stderr": f"Language '{language}' is not supported.",
-            "exit_code": 1, "sandbox": "none", "language": language, "runtime": language,
+            "stdout": "", "stderr": "The code runner is not available right now. Try again in a minute.",
+            "exit_code": 1, "sandbox": "remote", "language": language, "runtime": language,
         }
+    result["sandbox"] = "remote"
+    return result
+
+
+def run_here(language: str, code: str, stdin: str = "", timeout: int = TIMEOUT) -> dict:
+    """Run on this machine: inside the sandbox container, or on a developer laptop."""
+    if language not in LANG_CONFIG:
+        return _unsupported(language)
     # Windows Store aliases hijack python/python3. Always run student Python
     # with the API's conda interpreter -- never docker python3, never PATH.
     if language == "python":
@@ -157,11 +227,11 @@ def run_code(language: str, code: str, stdin: str = "", timeout: int = TIMEOUT) 
     return _local(language, code, stdin, timeout)
 
 
-def _run_shell(cmd: str, stdin: str, cwd: str, timeout: int) -> tuple[bool, str, str]:
+def _run_shell(cmd: str | list[str], stdin: str, cwd: str, timeout: int) -> tuple[bool, str, str]:
     """Blocking local subprocess run — internal to _local()."""
     try:
         r = subprocess.run(
-            cmd, shell=True, input=stdin.encode(),
+            cmd, shell=isinstance(cmd, str), input=stdin.encode(),
             capture_output=True, timeout=timeout, cwd=cwd, env=child_env(),
         )
         return (
@@ -234,7 +304,7 @@ def _local(language: str, code: str, stdin: str, timeout: int) -> dict:
             ok, stdout, stderr = _local_python(src, stdin, tmp, timeout)
             runtime = python_display()
         else:
-            run_cmd = run_tpl.format(src=src, out=out, dir=tmp)
+            run_cmd = [binary, *_OCTAVE_ARGS, src] if language == "matlab" else run_tpl.format(src=src, out=out, dir=tmp)
             ok, stdout, stderr = _run_shell(run_cmd, stdin, tmp, timeout)
             runtime = binary
         return {

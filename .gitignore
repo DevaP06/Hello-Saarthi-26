@@ -100,3 +100,6 @@ eval/reports/
 
 # AI regression tests are tracked (the generic "tests/" rule above would otherwise hide them)
 !saarthi_backend/tests/
+
+# Production secrets
+deploy/.env.production

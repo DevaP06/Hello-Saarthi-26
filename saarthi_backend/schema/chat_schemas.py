@@ -30,11 +30,14 @@ class StreamMessageRequest(BaseModel):
     """POST /api/chat/stream — streams response via SSE."""
     message: str = Field(..., min_length=1)
     conversationHistory: list[ChatMessageItem] = Field(default_factory=list)
-    conversationId: Optional[str] = Field(None, description="If provided, exchange is persisted.")
+    conversationId: Optional[str] = Field(None, pattern=r"^[1-9][0-9]{0,9}$", description="If provided, exchange is persisted.")
     contextMaterialTitle: Optional[str] = None
+    contextMaterialId: Optional[int] = Field(None, gt=0)
     courseId: Optional[int] = None
     contextVideoId: Optional[int] = None
     contextVideoTitle: Optional[str] = None
+    moduleId: Optional[int] = Field(None, gt=0)
+    structured: bool = False
     planning: bool = Field(False, description="If true, use ReAct planning mode (slower, shows thinking).")
     answerMode: Literal["auto", "socratic", "direct"] = Field(
         "auto",
@@ -93,6 +96,7 @@ class ConversationResponse(BaseModel):
     title: str
     createdAt: str
     updatedAt: str
+    courseId: Optional[int] = None
 
 
 class ChatMessageResponseItem(BaseModel):
@@ -100,18 +104,20 @@ class ChatMessageResponseItem(BaseModel):
     role: Literal["user", "assistant"]
     content: str
     createdAt: str
+    rating: Optional[Literal["up", "down"]] = None
+    courseId: Optional[int] = None
+    topic: Optional[str] = None
+    replyToId: Optional[int] = None
+    answerMetadata: Optional[dict] = None
 
 
-class ConversationDetailResponse(BaseModel):
-    id: str
-    title: str
-    createdAt: str
-    updatedAt: str
+class ConversationDetailResponse(ConversationResponse):
     messages: list[ChatMessageResponseItem] = Field(default_factory=list)
 
 
 class CreateConversationRequest(BaseModel):
     title: str = Field(default="New Chat", max_length=255)
+    courseId: Optional[int] = Field(None, gt=0)
 
 
 class UpdateConversationRequest(BaseModel):
@@ -240,6 +246,7 @@ class AnswerFeedbackRequest(BaseModel):
     cacheEntryId: Optional[int] = None
     conversationId: Optional[str] = None
     answer: Optional[str] = Field(None, max_length=8000, description="The rated answer, shown to the instructor on thumbs-down.")
+    messageId: Optional[int] = None  # the rated answer in a saved conversation
 
 
 class AnswerFeedbackResponse(BaseModel):

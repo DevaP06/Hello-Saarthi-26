@@ -1,6 +1,7 @@
 """In-process adapter: runs src/ LangGraph and returns the assistant answer for chat."""
 import asyncio
 import contextvars
+import json
 import logging
 import os
 import re as _re
@@ -94,6 +95,10 @@ def _cite_item(src, agent: str = "", number: int | None = None) -> dict:
         "page_number": d.get("page_number") if d.get("page_number") is not None else d.get("page"),
         "snippet": (d.get("snippet") or d.get("text") or "")[:280],
         "chunk_id": d.get("id") or d.get("chunk_id"),
+        "course_id": d.get("course_id"),
+        "material_id": d.get("material_id"),
+        "video_id": d.get("video_id"),
+        "start_sec": d.get("start_sec"),
     }
 
 
@@ -492,8 +497,20 @@ async def run_document_chat(
         return "Something went wrong while generating a response. Please try again."
 
 
+structured_sse = contextvars.ContextVar("structured_chat_sse", default=False)
+_SSE_DELTA_PREFIX = "event: delta\ndata: "
+
+
 def _sse_data(text: str) -> str:
+    if structured_sse.get():
+        return f"{_SSE_DELTA_PREFIX}{json.dumps(text)}\n\n"
     return f"data: {text.replace(chr(10), chr(92) + 'n')}\n\n"
+
+
+def sse_delta_text(frame: str) -> str:
+    if frame.startswith(_SSE_DELTA_PREFIX):
+        return json.loads(frame[len(_SSE_DELTA_PREFIX):])
+    return frame[6:].rstrip("\n").replace("\\n", "\n")
 
 
 def _sse_status(stage: str, detail: str = "") -> str:
@@ -712,7 +729,7 @@ async def _emit_reply(
         tokens = _stream_llm_tokens(messages, tier=tier, max_tokens=max_tokens)
         try:
             async for tok in tokens:
-                piece = tok[6:].rstrip("\n").replace("\\n", "\n")
+                piece = sse_delta_text(tok)
                 out.append(piece)
                 pending += piece
                 joined = "".join(out)

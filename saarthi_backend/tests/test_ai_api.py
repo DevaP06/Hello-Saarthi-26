@@ -216,6 +216,171 @@ def test_search_access_rules_and_input_checks(env):
     assert search(env, "out@x.io", query="Nyquist").json()["total_returned"] == 0  # no private course material
 
 
+def test_content_search_only_returns_course_notes_the_student_can_access(env):
+    result = search(env, "s1@x.io", query="Nyquist sampling", include_courses=True, content_types=["notes"])
+    assert result.status_code == 200
+    chunks = result.json()["results"]
+    assert chunks and any("MARKER_ALPHA" in chunk["text"] for chunk in chunks)
+    assert all(chunk["metadata"]["course_id"] == int(env.A) for chunk in chunks)
+    assert all(chunk["metadata"]["material_id"] and "MARKER_BRAVO" not in chunk["text"] for chunk in chunks)
+    assert search(env, "out@x.io", query="Nyquist sampling", include_courses=True).json()["results"] == []
+
+
+def test_pdf_highlights_are_private_and_follow_the_file_version(env):
+    from io import BytesIO
+    from pypdf import PdfReader, PdfWriter
+    from saarthi_backend.tests.test_pdf_indexing import _make_simple_pdf
+
+    client = env.client
+    teacher, student, classmate, outsider = (env.h(who) for who in ("t@x.io", "s1@x.io", "s2@x.io", "out@x.io"))
+    base = f"/api/courses/{env.A}/materials"
+
+    def upload_pdf(name, text):
+        pdf = PdfWriter()
+        pdf.add_blank_page(600, 800)
+        pdf.append_pages_from_reader(PdfReader(BytesIO(_make_simple_pdf(text))))
+        payload = BytesIO()
+        pdf.write(payload)
+        response = client.post("/api/courses/upload", files={"file": (name, payload.getvalue())}, headers=teacher)
+        assert response.status_code == 200
+        return response.json()["url"]
+
+    quote = "The impulse response completely characterizes a linear time invariant system."
+    created = client.post(base, json={"title": "Two-page handout", "type": "doc", "url": upload_pdf("handout.pdf", quote)}, headers=teacher)
+    assert created.status_code == 201
+    path = f"{base}/{created.json()['id']}"
+    annotations = f"{path}/annotations"
+    for _ in range(100):
+        indexed = client.get(f"{path}/index-status", headers=teacher).json()
+        if indexed["status"] in ("done", "error"):
+            break
+        time.sleep(0.05)
+    assert indexed["status"] == "done", indexed
+    hits = search(env, "s1@x.io", query="impulse response", course_id=int(env.A)).json()["results"]
+    assert any(hit["metadata"].get("page") == 2 and str(hit["metadata"].get("material_id")) == created.json()["id"]
+               and quote in hit["text"] for hit in hits)
+    document = client.get(f"{path}/file", headers=student)
+    assert document.status_code == 200 and document.headers["content-type"] == "application/pdf"
+    version = document.headers["x-document-version"]
+    body = {"documentVersion": version, "page": 2, "quote": quote, "note": "Review before the exam",
+            "rectangles": [{"x": 0.12, "y": 0.3, "width": 0.45, "height": 0.02}]}
+    response = client.post(annotations, json=body, headers=student)
+    assert response.status_code == 201
+    saved = response.json()
+    assert saved == {"id": saved["id"], **body}
+    assert client.get(annotations, headers=student).json() == [saved]
+    assert client.get(annotations, headers=classmate).json() == []
+    assert client.get(annotations, headers=teacher).json() == []
+    assert client.get(annotations, headers=outsider).status_code == 403
+    assert client.delete(f"{annotations}/{saved['id']}", headers=classmate).status_code == 404
+    assert client.post(annotations, json={**body, "rectangles": [dict(body["rectangles"][0], width=1)]},
+                       headers=student).status_code == 422
+
+    assert client.patch(path, json={"url": upload_pdf("replacement.pdf", "A new revision")}, headers=teacher).status_code == 200
+    replacement = client.get(f"{path}/file", headers={**student, "Range": "bytes=0-9"})
+    assert replacement.status_code == 206 and replacement.headers["x-document-version"] != version
+    assert client.get(annotations, headers=student).json() == []
+    assert client.post(annotations, json=body, headers=student).status_code == 400
+    assert client.delete(f"{annotations}/{saved['id']}", headers=student).status_code == 204
+
+
+def test_course_archive_keeps_members_and_closes_new_enrollments(env):
+    client = env.client
+    owner, student, outsider = (env.h(who) for who in ("t@x.io", "s1@x.io", "out@x.io"))
+    root = "/api/courses"
+    created = client.post(root, headers=owner, json={"title": "Course lifecycle", "code": "ARCH", "instructor": "T"})
+    assert created.status_code == 201
+    course_id = created.json()["id"]
+    path = f"{root}/{course_id}"
+    code = client.post(f"{path}/invite", headers=owner, json={"email": "*"}).json()["inviteCode"]
+    assert client.post(f"{root}/join", headers=student, json={"inviteCode": code}).status_code == 200
+    assert client.put(f"{path}/archive", headers=student, json={"archived": True}).status_code == 403
+    archive = client.put(f"{path}/archive", headers=owner, json={"archived": True})
+    assert archive.status_code == 200 and archive.json()["archivedAt"]
+    assert client.put(f"{path}/archive", headers=owner, json={"archived": True}).json()["archivedAt"] == archive.json()["archivedAt"]
+
+    for member in (owner, student):
+        active = client.get(root, headers=member, params={"archived": False}).json()
+        archived = client.get(root, headers=member, params={"archived": True}).json()
+        assert not any(course["id"] == course_id for course in active["items"])
+        assert [course["id"] for course in archived["items"]] == [course_id] and archived["total"] == 1
+    assert client.get(path, headers=student).status_code == 200
+    assert client.get(f"{path}/materials", headers=student).status_code == 200
+    assert client.post(f"{path}/invite", headers=owner, json={"email": "*"}).status_code == 400
+    assert client.post(f"{root}/join", headers=outsider, json={"inviteCode": code}).status_code == 400
+
+    restored = client.put(f"{path}/archive", headers=owner, json={"archived": False})
+    assert restored.status_code == 200 and restored.json()["archivedAt"] is None
+    assert client.post(f"{root}/join", headers=outsider, json={"inviteCode": code}).status_code == 200
+
+
+def test_course_syllabus_is_private_and_replaceable(env):
+    from saarthi_backend.tests.test_pdf_indexing import _make_simple_pdf
+
+    client = env.client
+    owner, student, other_teacher, outsider = (env.h(who) for who in ("t@x.io", "s1@x.io", "t2@x.io", "out@x.io"))
+    course = f"/api/courses/{env.A}"
+    path = f"{course}/syllabus"
+    first = _make_simple_pdf("Course syllabus version one")
+    replacement = _make_simple_pdf("Course syllabus version two")
+    files = {"file": ("syllabus.pdf", first, "application/pdf")}
+    assert client.get(path, headers=student).status_code == 404
+    assert client.put(path, headers=student, files=files).status_code == 403
+    assert client.put(path, headers=other_teacher, files=files).status_code == 403
+    assert client.put(path, headers=owner, files={"file": ("invalid.pdf", b"plain text")}).status_code == 400
+    saved = client.put(path, headers=owner, files=files)
+    assert saved.status_code == 200 and saved.json()["syllabusName"] == "syllabus.pdf"
+    assert client.get(path, headers=outsider).status_code == 403
+    response = client.get(path, headers=student)
+    assert response.status_code == 200 and response.content == first
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.headers["content-disposition"].endswith("syllabus.pdf")
+    assert client.get(course, headers=student).json()["syllabusName"] == "syllabus.pdf"
+
+    saved = client.put(path, headers=owner, files={"file": ("updated.pdf", replacement, "application/pdf")})
+    assert saved.status_code == 200 and saved.json()["syllabusName"] == "updated.pdf"
+    assert client.get(path, headers=student).content == replacement
+
+
+def test_module_prerequisites_are_scoped_and_survive_rename_and_reorder(env):
+    client = env.client
+    owner, student, other_teacher = (env.h(who) for who in ("t@x.io", "s1@x.io", "t2@x.io"))
+    path = f"/api/courses/{env.A}/modules"
+
+    def create_topic(url, title, headers):
+        response = client.post(url, headers=headers, json={"title": title})
+        assert response.status_code == 201
+        return int(response.json()["id"])
+
+    basics, examples, advanced = (create_topic(path, title, owner) for title in ("Basics", "Examples", "Advanced"))
+    foreign = create_topic(f"/api/courses/{env.B}/modules", "Other course", other_teacher)
+
+    def set_dependencies(module_id, prerequisite_ids, headers=owner):
+        return client.patch(f"{path}/{module_id}", headers=headers, json={"prerequisiteIds": prerequisite_ids})
+
+    assert set_dependencies(examples, [basics], student).status_code == 403
+    assert set_dependencies(examples, [foreign]).status_code == 400
+    assert set_dependencies(examples, [examples]).status_code == 400
+    assert set_dependencies(examples, [basics, basics]).json()["prerequisiteIds"] == [str(basics)]
+    assert set_dependencies(advanced, [examples]).status_code == 200
+    assert set_dependencies(basics, [advanced]).status_code == 400
+    assert client.patch(f"{path}/{basics}", headers=owner, json={"title": "Foundations"}).status_code == 200
+    initial_order = [int(item["id"]) for item in client.get(path, headers=student).json()]
+    assert client.put(f"{path}/order", headers=owner, json={"moduleIds": [advanced, basics, foreign]}).status_code == 400
+    assert [int(item["id"]) for item in client.get(path, headers=student).json()] == initial_order
+    order = [advanced, examples, basics] + [item for item in initial_order if item not in (advanced, examples, basics)]
+    reordered = client.put(f"{path}/order", headers=owner, json={"moduleIds": order})
+    assert reordered.status_code == 200
+    modules = client.get(path, headers=student).json()
+    assert [int(module["id"]) for module in modules] == order
+    assert modules[1]["prerequisiteIds"] == [str(basics)] and modules[2]["title"] == "Foundations"
+
+    assert client.delete(f"{path}/{basics}", headers=owner).status_code == 204
+    modules_by_id = {int(item["id"]): item for item in client.get(path, headers=student).json()}
+    assert modules_by_id[examples]["prerequisiteIds"] == []
+    assert modules_by_id[advanced]["prerequisiteIds"] == [str(examples)]
+
+
 def test_context_roundtrip_and_ownership(env):
     c = env.client
     s1, s2 = env.h("s1@x.io"), env.h("s2@x.io")
@@ -299,6 +464,91 @@ def test_streamed_unscoped_chat_inherits_the_scope(env, monkeypatch):
     monkeypatch.setattr(adapter, "run_chat_stream", fake_stream)
     assert stream(env, "s1@x.io", "hello there").status_code == 200
     assert "MARKER_ALPHA" in seen["text"] and "MARKER_BRAVO" not in seen["text"]
+
+
+def test_course_chat_saves_hints_sources_history_and_teacher_query_actions(env, monkeypatch):
+    import saarthi_backend.ai.adapter as adapter
+
+    async def fake_tokens(messages, **kwargs):
+        yield adapter._sse_data("Think about \\nabla and the highest frequency.\n[Notes MARKER ALPHA]")
+
+    monkeypatch.setattr(adapter, "_stream_llm_tokens", fake_tokens)
+    client = env.client
+    student = env.h("s1@x.io")
+    teacher = env.h("t@x.io")
+    outsider = env.h("out@x.io")
+    other_teacher = env.h("t2@x.io")
+    course = int(env.A)
+    module = client.post(f"/api/courses/{course}/modules", headers=teacher, json={"title": "Sampling"})
+    assert module.status_code == 201, module.text
+    context = {"courseId": course, "moduleId": int(module.json()["id"]), "answerMode": "socratic", "structured": True}
+    denied = client.post("/api/chat/conversations", headers=outsider, json={"courseId": course})
+    assert denied.status_code == 404
+    conv = client.post("/api/chat/conversations", headers=student, json={"courseId": course})
+    assert conv.status_code == 201, conv.text
+    conversation_id = conv.json()["id"]
+    question = f"Why does sampling below the Nyquist rate cause aliasing? {PII}"
+    denied = stream(env, "s2@x.io", question, conversationId=conversation_id, **context)
+    assert denied.status_code == 404
+
+    for _ in range(2):
+        result = stream(env, "s1@x.io", question, conversationId=conversation_id, **context)
+        assert result.status_code == 200 and "event: saved\n" in result.text, result.text
+        saved = json.loads(next(frame.split("data: ", 1)[1] for frame in result.text.split("\n\n")
+                               if frame.startswith("event: saved")))
+        assert "\\nabla" in saved["assistantMessage"]["content"]
+        assert "\n[Notes" in saved["assistantMessage"]["content"]
+        assert saved["assistantMessage"]["replyToId"] == int(saved["userMessage"]["id"])
+        metadata = saved["assistantMessage"]["answerMetadata"]
+        assert metadata["socratic"] == "hint"
+        assert metadata["confidence"] in ("ok", "low")
+        assert metadata["citations"][0]["course_id"] == course and metadata["citations"][0]["material_id"]
+
+    date = saved["userMessage"]["createdAt"][:10]
+    filtered = client.get("/api/chat/conversations", headers=student, params={"topic": "Sampling", "onDate": date}).json()
+    assert any(item["id"] == conversation_id for item in filtered["items"])
+    assert client.get("/api/chat/conversations", headers=student, params={"topic": "unmatched"}).json()["total"] == 0
+
+    route = f"/api/reviews/queries?courseId={course}&topic=Sampling&onDate={date}"
+    assert client.get(route, headers=other_teacher).status_code == 403
+    assert client.get(route, headers=student).status_code == 403
+    response = client.get(route, headers=teacher)
+    assert response.status_code == 200, response.text
+    log = response.json()
+    assert len(log["items"]) == 2 and log["frequent"][0]["count"] == 2
+    assert _no_pii(" ".join(item["query"] for item in log["items"]))
+    query_id = log["items"][0]["id"]
+    note = client.patch(f"/api/reviews/queries/{query_id}/note", params={"courseId": course}, headers=teacher,
+                        json={"note": "Review in the next lecture."})
+    assert note.status_code == 200, note.text
+    corrected = client.post(f"/api/reviews/queries/{query_id}/correct", params={"courseId": course}, headers=teacher,
+                            json={"correction": "Sampling too slowly overlaps shifted copies of the spectrum."})
+    assert corrected.status_code == 200 and corrected.json()["indexed"], corrected.text
+    assert client.get(route, headers=teacher).json()["items"][0]["instructorNote"] == "Review in the next lecture."
+
+
+def test_course_chat_can_return_a_saved_turn_as_json(env, monkeypatch):
+    import saarthi_backend.ai.adapter as adapter
+
+    async def fake_tokens(messages, **kwargs):
+        yield adapter._sse_data("Consider how the highest frequency affects the sampling rate. [Notes MARKER_ALPHA]")
+
+    monkeypatch.setattr(adapter, "_stream_llm_tokens", fake_tokens)
+    headers = {**env.h("s1@x.io"), "Accept": "application/json"}
+    course_id = int(env.A)
+    conversation = env.client.post("/api/chat/conversations", json={"courseId": course_id}, headers=headers).json()
+    conversation_id = conversation["id"]
+    payload = {"message": "Why does the Nyquist rate depend on the highest frequency?", "answerMode": "socratic"}
+    response = env.client.post("/api/chat/stream", json={**payload, "conversationId": conversation_id}, headers=headers)
+    assert response.status_code == 200 and response.headers["content-type"].startswith("application/json")
+    turn = response.json()
+    assert turn["assistantMessage"]["replyToId"] == int(turn["userMessage"]["id"])
+    metadata = turn["assistantMessage"]["answerMetadata"]
+    assert metadata["socratic"] == "hint"
+    assert any(item["course_id"] == course_id and item["material_id"] for item in metadata["citations"])
+    messages = env.client.get(f"/api/chat/conversations/{conversation_id}", headers=headers).json()["messages"]
+    assert [item["id"] for item in messages] == [turn["userMessage"]["id"], turn["assistantMessage"]["id"]]
+    assert env.client.post("/api/chat/stream", json=payload, headers=headers).status_code == 400
 
 
 # ── PII never reaches the model from study tools ────────────────────────────
@@ -393,6 +643,7 @@ def test_ask_notes_uses_the_ai_core_scoped_and_scrubbed(env, kb_model):
     body = r.json()
     texts = " ".join(s["text"] for s in body["sources"])
     assert body["sources"] and "MARKER_ALPHA" in texts and "MARKER_BRAVO" not in texts   # caller's course only
+    assert any(s["courseId"] == int(env.A) and s["materialId"] for s in body["sources"])
     assert "Nyquist" in body["answer"]
     assert len(kb_model) == 1 and _no_pii(kb_model[0])                                  # nothing personal sent
 
@@ -459,3 +710,38 @@ def test_chat_uses_gemini_by_default_scrubbed_and_the_ai_core_with_chat_source_c
     monkeypatch.setenv("CHAT_SOURCE", "core")  # our model deployed
     r = send()
     assert "from the AI core" in r.text and _no_pii(seen["core"])
+
+
+def test_general_chat_clarifies_an_unspecified_exam_portion(env, monkeypatch):
+    from src.knowledge_base import gemini_rag
+
+    calls = []
+
+    def fake_answer(question, k, history=None):
+        calls.append(question)
+        return {"answer": "Let’s look at the DSP material.", "sources": []}
+
+    monkeypatch.delenv("CHAT_SOURCE", raising=False)
+    monkeypatch.setattr(gemini_rag, "index_ready", lambda: True)
+    monkeypatch.setattr(gemini_rag, "answer", fake_answer)
+    headers = env.h("s1@x.io")
+    conv = env.client.post("/api/chat/conversations", json={}, headers=headers).json()["id"]
+    route = f"/api/chat/conversations/{conv}/messages"
+    response = env.client.post(route, json={"message": "Can you tell me the whole portion?"}, headers=headers)
+    assert response.status_code == 201
+    answer = response.json()["assistantMessage"]
+    assert answer["content"].startswith("Which subject, exam, or module do you mean?")
+    assert answer["topic"] == "General" and not calls
+
+    response = env.client.post("/api/chat/stream", headers={**headers, "Accept": "application/json"}, json={
+        "message": "tell whole portion", "conversationId": conv, "answerMode": "socratic",
+    })
+    assert response.status_code == 200
+    assistant = response.json()["assistantMessage"]
+    assert assistant["content"] == answer["content"]
+    assert assistant["answerMetadata"]["citations"] == []
+    assert assistant["answerMetadata"]["socratic"] is None
+
+    specific = "What is the full syllabus for the DSP midterm?"
+    response = env.client.post(route, json={"message": specific}, headers=headers)
+    assert response.status_code == 201 and calls == [specific]

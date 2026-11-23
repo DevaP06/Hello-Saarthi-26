@@ -5,12 +5,12 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from saarthi_backend.deps import get_current_user, get_db
 from saarthi_backend.dao.notification_dao import NotificationDAO
-from saarthi_backend.model import Course, Enrollment, User
+from saarthi_backend.model import Course, CourseModule, Enrollment, User
 from saarthi_backend.model.code_problem_model import CodeProblem, CodeSubmission
 from saarthi_backend.schema.code_schemas import (
     CodeExecuteRequest,
@@ -81,8 +81,8 @@ def _normalize_output(text: str) -> str:
     return "\n".join(lines)
 
 
-def _problem_to_response(p: CodeProblem) -> CodeProblemResponse:
-    """Convert a CodeProblem ORM row to CodeProblemResponse."""
+def _problem_to_response(p: CodeProblem, course_title: str | None = None, can_edit: bool = False) -> CodeProblemResponse:
+    """Convert a CodeProblem ORM row to CodeProblemResponse. Editors see hidden test cases in full."""
     return CodeProblemResponse(
         id=p.id,
         title=p.title,
@@ -96,11 +96,68 @@ def _problem_to_response(p: CodeProblem) -> CodeProblemResponse:
         topics=p.topics,
         sortOrder=p.sort_order,
         testCases=[
-            TestCasePublic(hidden=True) if c.get("hidden")
-            else TestCasePublic(input=c.get("input", ""), expectedOutput=c["expectedOutput"])
+            TestCasePublic(hidden=True) if c.get("hidden") and not can_edit
+            else TestCasePublic(input=c.get("input", ""), expectedOutput=c["expectedOutput"], hidden=bool(c.get("hidden")))
             for c in _test_cases(p)
         ],
+        courseId=p.course_id,
+        courseTitle=course_title,
+        topic=p.topic,
+        canEdit=can_edit,
     )
+
+
+# ---------------------------------------------------------------------------
+# Access: practice problems (no course) are for everyone; a course's problems are
+# for its teacher and enrolled students. Only the course teacher (or an admin) edits.
+# ---------------------------------------------------------------------------
+
+_PROBLEM_ROW = select(CodeProblem, Course.title, Course.owner_id).outerjoin(Course, Course.id == CodeProblem.course_id)
+
+
+def _normalize_topic(topic: str | None) -> str | None:
+    t = (topic or "").strip()
+    return None if not t or t == "No topic" else t
+
+
+async def _member_course_ids(db: AsyncSession, user: User) -> list[int] | None:
+    """Ids of the courses whose problems the user may see; None means every course (admin)."""
+    if user.role == "admin":
+        return None
+    if user.role == "teacher":
+        stmt = select(Course.id).where(Course.owner_id == user.id)
+    else:
+        stmt = select(Enrollment.course_id).where(Enrollment.user_id == user.id)
+    return list((await db.execute(stmt)).scalars().all())
+
+
+def _can_edit(user: User, p: CodeProblem, owner_id: int | None) -> bool:
+    if user.role == "admin":
+        return True
+    return p.course_id is not None and user.role == "teacher" and owner_id == user.id
+
+
+async def _visible_problem(
+    db: AsyncSession, user: User, problem_id: int, *, active_only: bool = True,
+) -> tuple[CodeProblem, str | None, bool]:
+    """(problem, course title, can edit) when the user may see the problem; otherwise 404."""
+    stmt = _PROBLEM_ROW.where(CodeProblem.id == problem_id)
+    if active_only:
+        stmt = stmt.where(CodeProblem.is_active == True)  # noqa: E712
+    row = (await db.execute(stmt)).first()
+    if row:
+        p, course_title, owner_id = row
+        ids = await _member_course_ids(db, user) if p.course_id is not None else None
+        if ids is None or p.course_id in ids:
+            return p, course_title, _can_edit(user, p, owner_id)
+    raise HTTPException(status_code=404, detail="Problem not found")
+
+
+async def _editable_problem(db: AsyncSession, user: User, problem_id: int, **kw) -> tuple[CodeProblem, str | None]:
+    p, course_title, can_edit = await _visible_problem(db, user, problem_id, **kw)
+    if not can_edit:
+        raise HTTPException(status_code=403, detail="Only the course teacher can change this problem.")
+    return p, course_title
 
 
 @router.post("/execute", response_model=CodeExecuteResponse)
@@ -142,7 +199,7 @@ async def explain_error(
 
 @router.get("/runtimes")
 async def list_runtimes():
-    """List all languages/versions available on the Piston execution engine."""
+    """List the Code Lab runner's languages and availability."""
     return await code_service.list_runtimes()
 
 
@@ -155,14 +212,21 @@ async def list_problems(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Return all active coding lab problems ordered by sort_order."""
-    result = await db.execute(
-        select(CodeProblem)
+    """Practice problems first, then each of the user's courses, lesson by lesson (Classwork order)."""
+    stmt = (
+        _PROBLEM_ROW
+        .outerjoin(CourseModule, and_(CourseModule.course_id == CodeProblem.course_id, CourseModule.title == CodeProblem.topic))
         .where(CodeProblem.is_active == True)  # noqa: E712
-        .order_by(CodeProblem.sort_order, CodeProblem.id)
     )
-    problems = result.scalars().all()
-    return [_problem_to_response(p) for p in problems]
+    ids = await _member_course_ids(db, user)
+    if ids is not None:
+        stmt = stmt.where(or_(CodeProblem.course_id.is_(None), CodeProblem.course_id.in_(ids)))
+    stmt = stmt.order_by(
+        CodeProblem.course_id.is_not(None), Course.title, CourseModule.sort_order.nulls_last(),
+        CodeProblem.topic.nulls_last(), CodeProblem.sort_order, CodeProblem.id,
+    )
+    rows = (await db.execute(stmt)).all()
+    return [_problem_to_response(p, title, _can_edit(user, p, owner_id)) for p, title, owner_id in rows]
 
 
 @router.get("/problems/{problem_id}", response_model=CodeProblemResponse)
@@ -171,14 +235,8 @@ async def get_problem(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Return a single active coding lab problem by id."""
-    result = await db.execute(
-        select(CodeProblem).where(CodeProblem.id == problem_id, CodeProblem.is_active == True)  # noqa: E712
-    )
-    problem = result.scalar_one_or_none()
-    if not problem:
-        raise HTTPException(status_code=404, detail="Problem not found")
-    return _problem_to_response(problem)
+    """Return a single active coding lab problem the user may see."""
+    return _problem_to_response(*await _visible_problem(db, user, problem_id))
 
 
 @router.post("/problems", response_model=CodeProblemResponse, status_code=201)
@@ -187,10 +245,23 @@ async def create_problem(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Create a new coding lab problem. Requires admin or teacher role."""
+    """Add a problem to a lesson of one of your courses. Only admins may add course-less practice problems."""
     if user.role not in ("admin", "teacher"):
         raise HTTPException(status_code=403, detail="Admin or teacher role required")
+    course_title = None
+    if body.courseId is None:
+        if user.role != "admin":
+            raise HTTPException(status_code=400, detail="Choose one of your courses for this problem.")
+    else:
+        course = await db.get(Course, body.courseId)
+        if not course:
+            raise HTTPException(status_code=404, detail="Course not found")
+        if user.role != "admin" and course.owner_id != user.id:
+            raise HTTPException(status_code=403, detail="You can only add problems to your own courses.")
+        course_title = course.title
     problem = CodeProblem(
+        course_id=body.courseId,
+        topic=_normalize_topic(body.topic),
         title=body.title,
         difficulty=body.difficulty,
         points=body.points,
@@ -206,7 +277,7 @@ async def create_problem(
     db.add(problem)
     await db.commit()
     await db.refresh(problem)
-    return _problem_to_response(problem)
+    return _problem_to_response(problem, course_title, True)
 
 
 @router.patch("/problems/{problem_id}", response_model=CodeProblemResponse)
@@ -216,13 +287,10 @@ async def update_problem(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Partially update a coding lab problem. Requires admin or teacher role."""
-    if user.role not in ("admin", "teacher"):
-        raise HTTPException(status_code=403, detail="Admin or teacher role required")
-    result = await db.execute(select(CodeProblem).where(CodeProblem.id == problem_id))
-    problem = result.scalar_one_or_none()
-    if not problem:
-        raise HTTPException(status_code=404, detail="Problem not found")
+    """Partially update a problem (course teacher or admin). The course cannot change; the lesson can."""
+    problem, course_title = await _editable_problem(db, user, problem_id, active_only=False)
+    if body.topic is not None:
+        problem.topic = _normalize_topic(body.topic)
     if body.title is not None:
         problem.title = body.title
     if body.difficulty is not None:
@@ -249,7 +317,7 @@ async def update_problem(
         problem.test_cases_json = json.dumps([c.model_dump() for c in body.testCases])
     await db.commit()
     await db.refresh(problem)
-    return _problem_to_response(problem)
+    return _problem_to_response(problem, course_title, True)
 
 
 @router.delete("/problems/{problem_id}", status_code=204)
@@ -258,13 +326,8 @@ async def delete_problem(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Soft-delete a coding lab problem (sets is_active=False). Requires admin role."""
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
-    result = await db.execute(select(CodeProblem).where(CodeProblem.id == problem_id))
-    problem = result.scalar_one_or_none()
-    if not problem:
-        raise HTTPException(status_code=404, detail="Problem not found")
+    """Hide a problem from the lab (soft delete: past submissions are kept). Course teacher or admin."""
+    problem, _ = await _editable_problem(db, user, problem_id)
     problem.is_active = False
     await db.commit()
 
@@ -272,15 +335,6 @@ async def delete_problem(
 # ---------------------------------------------------------------------------
 # Submissions: run every test case, save the result, tell the student's teachers
 # ---------------------------------------------------------------------------
-
-async def _active_problem(db: AsyncSession, problem_id: int) -> CodeProblem:
-    problem = (await db.execute(
-        select(CodeProblem).where(CodeProblem.id == problem_id, CodeProblem.is_active == True)  # noqa: E712
-    )).scalar_one_or_none()
-    if not problem:
-        raise HTTPException(status_code=404, detail="Problem not found")
-    return problem
-
 
 @router.post("/problems/{problem_id}/submit", response_model=CodeSubmitResponse)
 async def submit_solution(
@@ -290,7 +344,7 @@ async def submit_solution(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Run the code against each test case, save the submission and notify the student's teachers."""
-    problem = await _active_problem(db, problem_id)
+    problem, _, _ = await _visible_problem(db, user, problem_id)
     cases = _test_cases(problem)
     if not cases:
         raise HTTPException(status_code=400, detail="This problem has no test cases yet.")
@@ -321,10 +375,14 @@ async def submit_solution(
     db.add(sub)
     await db.flush()
     if user.role == "student":
-        owners = (await db.execute(
+        # A course problem goes to that course's teacher; a practice problem to all of the student's teachers.
+        owners_stmt = (
             select(Course.owner_id).join(Enrollment, Enrollment.course_id == Course.id)
-            .where(Enrollment.user_id == user.id, Course.owner_id.is_not(None)).distinct()
-        )).scalars().all()
+            .where(Enrollment.user_id == user.id, Course.owner_id.is_not(None))
+        )
+        if problem.course_id is not None:
+            owners_stmt = owners_stmt.where(Course.id == problem.course_id)
+        owners = (await db.execute(owners_stmt.distinct())).scalars().all()
         for owner_id in owners:
             await NotificationDAO.create(
                 db, user_id=owner_id, type="code_submission",
@@ -347,7 +405,7 @@ async def list_submissions(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Students see their own submissions; a teacher sees those of students in their courses."""
-    await _active_problem(db, problem_id)
+    await _visible_problem(db, user, problem_id)
     stmt = (
         select(CodeSubmission, User.full_name)
         .join(User, User.id == CodeSubmission.user_id)

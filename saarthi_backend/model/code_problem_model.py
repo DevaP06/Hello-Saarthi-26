@@ -25,6 +25,9 @@ class CodeProblem(Base):
     hints_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     starter_code_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     topics: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # NULL = practice problem for everyone; else only that course's members see it.
+    course_id: Mapped[int | None] = mapped_column(ForeignKey("saarthi_courses.id", ondelete="CASCADE"), nullable=True, index=True)
+    topic: Mapped[str | None] = mapped_column(String(128), nullable=True)  # the lesson (Classwork topic)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

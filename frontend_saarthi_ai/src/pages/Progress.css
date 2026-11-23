@@ -488,9 +488,98 @@
 }
 
 .progress-modules {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+    gap: 0.6rem;
+}
+
+.progress-module-row {
+    display: grid;
+    align-content: start;
+    gap: 0.35rem;
+    padding: 0.65rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+}
+
+.progress-module-row > div {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.4rem;
+    gap: 0.35rem;
+}
+
+.progress-module-row progress {
+    width: 100%;
+    height: 0.55rem;
+    accent-color: var(--primary);
+}
+
+.progress-report-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+    gap: 0.75rem;
+    margin-top: 0.75rem;
+}
+
+.progress-report-stats dt {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+.progress-report-stats dd {
+    margin: 0;
+    font-weight: 600;
+}
+
+.progress-readership {
+    margin: 1rem 0;
+}
+
+.progress-readership .progress-table-wrap,
+.progress-readership h5 {
+    margin-top: 0.75rem;
+}
+
+.progress-heat-cell {
+    display: inline-block;
+    padding: 0.2rem 0.5rem;
+    border-radius: 0.35rem;
+    white-space: nowrap;
+}
+
+.progress-dropoffs {
+    margin: 0.45rem 0 0;
+    padding-left: 1.2rem;
+}
+
+@media print {
+    body:has(.student-progress) .sidebar,
+    body:has(.student-progress) .topbar,
+    .student-progress .progress-print-hide {
+        display: none !important;
+    }
+
+    body:has(.student-progress) :is(.app-shell, .app-main, .app-content) {
+        display: block;
+        margin: 0;
+        padding: 0;
+        min-height: 0;
+        overflow: visible;
+        background: white;
+    }
+
+    .student-progress {
+        --surface: white;
+        --surface-2: white;
+        --text-primary: black;
+        --text-muted: #444;
+        --border: #bbb;
+        color: black;
+    }
+
+    .student-progress :is(.progress-stat-card, .progress-coverage-item, .progress-module-row, .progress-report-stats) {
+        break-inside: avoid;
+    }
 }
 
 .progress-module {

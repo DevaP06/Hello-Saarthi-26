@@ -3,7 +3,7 @@
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from saarthi_backend.model import Video, VideoProgress, VideoNote
+from saarthi_backend.model import User, Video, VideoProgress, VideoNote
 
 
 class VideoDAO:
@@ -86,6 +86,8 @@ class VideoProgressDAO:
                 VideoProgress.user_id == user_id,
                 VideoProgress.video_id == video_id,
             )
+            .order_by(VideoProgress.updated_at.desc(), VideoProgress.id.desc())
+            .limit(1)
         )
         return result.scalar_one_or_none()
 
@@ -98,10 +100,12 @@ class VideoProgressDAO:
         completed: bool = False,
     ) -> VideoProgress:
         from datetime import datetime, timezone
-        from sqlalchemy import update
-
+        # Serialize concurrent completions for this learner, including the first insert.
+        await db.execute(select(User.id).where(User.id == user_id).with_for_update())
         prog = await VideoProgressDAO.get(db, user_id, video_id)
         if prog:
+            if prog.position_seconds == position_seconds and prog.completed == completed:
+                return prog
             prog.position_seconds = position_seconds
             prog.completed = completed
             prog.updated_at = datetime.now(timezone.utc)

@@ -13,7 +13,7 @@ interface AIReview {
   replyMode?: string | null;
   confidence?: string | null;
   reasons: string[];
-  source: 'low_confidence' | 'thumbs_down';
+  source: 'low_confidence' | 'thumbs_down' | 'instructor';
   status: 'open' | 'corrected' | 'dismissed';
   occurrences: number;
   correction?: string | null;
@@ -29,6 +29,7 @@ const FILTERS: { id: Filter; label: string }[] = [
 ];
 
 function sourceLabel(r: AIReview): string {
+  if (r.source === 'instructor') return 'Instructor correction';
   if (r.source === 'thumbs_down') return 'Student rated it down';
   if (r.replyMode === 'not_covered') return 'Not in the course materials';
   return 'Low confidence';

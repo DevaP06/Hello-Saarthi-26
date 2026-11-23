@@ -6,6 +6,7 @@ import {
     type EnrollmentWithCourseResponse, type QuizAttemptResponse, type QuizDetailResponse, type QuizDifficulty, type QuizResponse,
 } from '../lib/api';
 import { usePageTitle } from '../lib/usePageTitle';
+import QuizReview from '../components/QuizReview';
 import './Quiz.css';
 
 const DIFFICULTY: Record<QuizDifficulty, { label: string; bg: string; color: string }> = {
@@ -29,7 +30,7 @@ function formatClock(seconds: number): string {
 }
 
 /** List of quizzes from the student's courses. */
-function QuizList({ onStart }: { onStart: (id: string) => void }) {
+function QuizList({ onStart, onReview }: { onStart: (id: string) => void; onReview: () => void }) {
     const [quizzes, setQuizzes] = useState<QuizResponse[]>([]);
     const [courseNames, setCourseNames] = useState<Record<string, string>>({});
     const [loading, setLoading] = useState(true);
@@ -56,6 +57,7 @@ function QuizList({ onStart }: { onStart: (id: string) => void }) {
             <div className="quiz-list-header">
                 <h1><GraduationCap size={22} /> Exam Practice</h1>
                 <p>Quizzes from your courses. Your answers are checked when you submit, with an explanation for each question.</p>
+                <button type="button" className="btn btn-outline btn-sm quiz-review-link" onClick={onReview}>Review due questions</button>
             </div>
             {loading ? (
                 <p className="quiz-list-empty">Loading quizzes…</p>
@@ -333,8 +335,13 @@ export default function QuizPage() {
     const navigate = useNavigate();
     const quizId = params.get('id');
 
+    if (params.get('review') === '1') {
+        const course = params.get('course') ?? undefined;
+        const topic = params.get('topic') ?? undefined;
+        return <QuizReview key={`${course}:${topic}`} courseId={course} topic={topic} onExit={() => setParams({})} />;
+    }
     if (quizId) {
         return <QuizAttempt key={quizId} quizId={quizId} onExit={() => (params.get('from') ? navigate(-1) : setParams({}))} />;
     }
-    return <QuizList onStart={(id) => setParams({ id })} />;
+    return <QuizList onStart={(id) => setParams({ id })} onReview={() => setParams({ review: '1' })} />;
 }

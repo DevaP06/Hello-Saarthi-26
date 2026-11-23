@@ -17,7 +17,7 @@ from saarthi_backend.schema.code_schemas import (
     CodeExplainRequest,
     CodeExplainResponse,
 )
-from saarthi_backend.service.sandbox import LANG_CONFIG, mode as sandbox_mode, run_code, runtime_missing
+from saarthi_backend.service.sandbox import LANG_CONFIG, mode as sandbox_mode, run_code, runtimes
 
 logger = logging.getLogger(__name__)
 from src.utils.llm import async_openai, chat_model_name
@@ -78,7 +78,11 @@ async def execute_code(body: CodeExecuteRequest) -> CodeExecuteResponse:
     # off the event loop.
     boxed = await loop.run_in_executor(None, run_code, lang, body.code, body.stdin or "")
     err = (boxed.get("stderr") or "")
-    if lang == "python" and ("Microsoft Store" in err or "WindowsApps" in err or "execution aliases" in err):
+    # Windows-laptop workaround only. Never with the sandbox container: the student controls
+    # stderr and could print these words to get their code re-run inside the backend.
+    if sandbox_mode() == "local" and lang == "python" and (
+        "Microsoft Store" in err or "WindowsApps" in err or "execution aliases" in err
+    ):
         boxed = await loop.run_in_executor(None, _run_with_api_python, body.code, body.stdin or "")
     elapsed = round((time.monotonic() - t0) * 1000, 1)
 
@@ -139,14 +143,16 @@ async def explain_error(body: CodeExplainRequest) -> CodeExplainResponse:
             f"Code:\n```{body.language}\n{_code_clean(body.code)[:3000]}\n```\n\n"
             f"Error (exit code {body.exitCode}):\n{_code_clean(body.stderr)[:1500]}"
         )
+        # The fast model is enough for this and answers in seconds. The token cap must leave
+        # room for "thinking" models (Gemini 3.x): at 600 the JSON came back cut off.
         response = await client.chat.completions.create(
-            model=chat_model_name(),
+            model=chat_model_name(fast=True),
             messages=[
                 {"role": "system", "content": _EXPLAIN_SYSTEM},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
-            max_tokens=600,
+            max_tokens=2048,
             response_format={"type": "json_object"},
         )
         data = json.loads(response.choices[0].message.content or "{}")
@@ -198,13 +204,13 @@ async def stream_explain_error(body: CodeExplainRequest) -> AsyncGenerator[str, 
             )
 
         stream = await client.chat.completions.create(
-            model=chat_model_name(),
+            model=chat_model_name(fast=True),
             messages=[
                 {"role": "system", "content": _EXPLAIN_STREAM_SYSTEM},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
-            max_tokens=300,
+            max_tokens=2048,  # room for "thinking" models; the prompt keeps answers short
             stream=True,
         )
         async for chunk in stream:
@@ -220,14 +226,5 @@ async def stream_explain_error(body: CodeExplainRequest) -> AsyncGenerator[str, 
 
 # ── Runtime list ──────────────────────────────────────────────────────────────
 async def list_runtimes() -> list[dict]:
-    """Which runtimes are actually usable right now: local binary present,
-    or the Docker sandbox is active (in which case availability depends on
-    SANDBOX_IMAGE — see sandbox.py docstring)."""
-    m = sandbox_mode()
-    result = []
-    for lang, (binary, _, _) in LANG_CONFIG.items():
-        if m == "docker":
-            result.append({"language": lang, "runtime": f"{binary} (docker, image={None})", "available": True})
-        else:
-            result.append({"language": lang, "runtime": binary, "available": runtime_missing(lang) is None})
-    return result
+    """Read runtime availability from the process that executes Code Lab submissions."""
+    return await asyncio.to_thread(runtimes)

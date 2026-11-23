@@ -39,6 +39,10 @@ class KBSource(BaseModel):
     topic: Optional[str] = None
     sourceType: Optional[str] = None
     score: Optional[float] = None  # similarity (Gemini path); None on the AI core path (rank order instead)
+    courseId: Optional[int] = None
+    materialId: Optional[int] = None
+    videoId: Optional[int] = None
+    startSeconds: Optional[int] = None
     text: str
 
 
@@ -104,6 +108,10 @@ def _core_answer(question: str, k: int, names: list[str] | None = None) -> dict:
             "page": f"{_ts(start)} (video)" if start is not None else page,
             "sourceType": "video" if start is not None else "notes",
             "score": None,
+            "courseId": field(c, "course_id"),
+            "materialId": field(c, "material_id"),
+            "videoId": field(c, "video_id"),
+            "startSeconds": start,
             "text": field(c, "text") or "",
         })
     return {"answer": answer, "sources": sources}

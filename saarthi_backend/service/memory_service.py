@@ -146,11 +146,13 @@ async def maybe_update_summary_bg(
     session_factory,
     conv_id: int,
     all_messages_from_db: list,
+    *,
+    student_names: list[str] | None = None,
 ) -> None:
     """Fire-and-forget variant that opens its own DB session (safe for asyncio.ensure_future)."""
     try:
         async with session_factory() as db:
-            await maybe_update_summary(db, conv_id, all_messages_from_db)
+            await maybe_update_summary(db, conv_id, all_messages_from_db, student_names=student_names)
     except Exception as e:
         logger.warning("memory_service[bg]: unhandled error for conv %s: %s", conv_id, e)
 
@@ -159,6 +161,8 @@ async def maybe_update_summary(
     db: AsyncSession,
     conv_id: int,
     all_messages_from_db: list,
+    *,
+    student_names: list[str] | None = None,
 ) -> None:
     """
     Called async AFTER the response is sent — never blocks the user.
@@ -167,7 +171,7 @@ async def maybe_update_summary(
     Triggers a re-summarization if >= SUMMARIZE_EVERY new messages exist beyond
     the last checkpoint.
     """
-    if not all_messages_from_db:
+    if len(all_messages_from_db) <= WORKING_WINDOW:
         logger.debug("memory[conv=%s]: no messages in DB, skipping summary update", conv_id)
         return
 
@@ -203,7 +207,10 @@ async def maybe_update_summary(
         return
 
     logger.info("memory[conv=%s]: TRIGGER summarization — compressing %d turns via gpt-4o-mini", conv_id, last_idx + 1 + len(msgs_to_summarize))
-    turns = [{"role": m.role, "content": m.content} for m in all_messages_from_db[:last_idx + 1 + len(msgs_to_summarize)]]
+    from src.safety.guard import scrub_pii
+
+    turns = [{"role": m.role, "content": scrub_pii(m.content, student_names)[0]}
+             for m in all_messages_from_db[:last_idx + 1 + len(msgs_to_summarize)]]
     new_summary = await _summarize_turns(turns)
 
     if new_summary:

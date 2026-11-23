@@ -34,7 +34,7 @@ function App() {
   }, [restoreSession, clearSession]);
 
   return (
-    <BrowserRouter basename="/Saarthi_-Documentation">
+    <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, '')}>
       <ToastProvider>
       <Routes>
         {/* Public Routes */}

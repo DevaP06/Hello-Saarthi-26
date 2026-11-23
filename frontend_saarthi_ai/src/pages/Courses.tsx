@@ -3,11 +3,12 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { usePageTitle } from '../lib/usePageTitle';
 import {
     Search, Grid3X3, List, BookOpen,
-    Plus, Edit3, Trash2, X, Save, LogIn
+    Plus, Edit3, Trash2, X, Save, LogIn, Archive, RotateCcw
 } from 'lucide-react';
 import { useAuthStore } from '../stores/auth.store';
 import { api, type CourseResponse, type PaginatedResponse, type EnrollmentWithCourseResponse, type MyInviteResponse } from '../lib/api';
 import Pagination from '../components/Pagination';
+import ConfirmModal from '../components/ConfirmModal';
 import { useToast } from '../components/Toast';
 import './Courses.css';
 
@@ -21,6 +22,7 @@ interface CourseItem {
     progress: number;
     thumbnail: string;
     description: string;
+    archivedAt: string | null;
 }
 
 function mapCourse(c: CourseResponse, progressPercent = 0): CourseItem {
@@ -32,6 +34,7 @@ function mapCourse(c: CourseResponse, progressPercent = 0): CourseItem {
         progress: progressPercent,
         thumbnail: c.thumbnailEmoji || '📚',
         description: c.description || '',
+        archivedAt: c.archivedAt ?? null,
     };
 }
 
@@ -48,8 +51,8 @@ export default function CoursesPage() {
     const [offset, setOffset] = useState(0);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
-    const [enrolledIds, setEnrolledIds] = useState<Record<string, number>>({});
     const [search, setSearch] = useState('');
+    const [showArchived, setShowArchived] = useState(false);
     const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
     const [invites, setInvites] = useState<MyInviteResponse[]>([]);
     const [inviteBusyId, setInviteBusyId] = useState<string | null>(null);
@@ -64,12 +67,12 @@ export default function CoursesPage() {
             setLoading(true);
             setError(null);
             try {
-                const res = await api.get<PaginatedResponse<CourseResponse>>('/courses', { limit: PAGE_SIZE, offset });
+                const res = await api.get<PaginatedResponse<CourseResponse>>('/courses', { limit: PAGE_SIZE, offset, archived: showArchived ? 1 : 0 });
                 if (cancelled) return;
                 const progressMap: Record<string, number> = {};
                 const enrollmentsRes = await api.get<PaginatedResponse<EnrollmentWithCourseResponse>>('/courses/my/enrollments', { limit: 100, offset: 0 });
                 (enrollmentsRes.items || []).forEach((e) => { progressMap[e.courseId] = e.progressPercent; });
-                setEnrolledIds(progressMap);
+                if (cancelled) return;
                 setCourses((res.items || []).map((c) => mapCourse(c, progressMap[c.id] ?? 0)));
                 setTotal(res.total ?? 0);
             } catch (e) {
@@ -79,7 +82,7 @@ export default function CoursesPage() {
             }
         })();
         return () => { cancelled = true; };
-    }, [offset, reloadKey]);
+    }, [offset, reloadKey, showArchived]);
 
     // Email invites from teachers, shown to students as cards they can accept or reject.
     useEffect(() => {
@@ -122,6 +125,8 @@ export default function CoursesPage() {
     const [showModal, setShowModal] = useState(false);
     const [editingCourse, setEditingCourse] = useState<CourseItem | null>(null);
     const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+    const [archiveTarget, setArchiveTarget] = useState<CourseItem | null>(null);
+    const [archiveBusy, setArchiveBusy] = useState(false);
 
     // Join with code (student)
     const [showJoinModal, setShowJoinModal] = useState(false);
@@ -160,10 +165,18 @@ export default function CoursesPage() {
     // Form state
     const [formData, setFormData] = useState<Partial<CourseItem>>({});
 
-    const filtered = courses.filter((c) => {
-        if (!isInstructor && enrolledIds[c.id] === undefined) return false;
-        return !search.trim() || c.title.toLowerCase().includes(search.toLowerCase()) || c.code.toLowerCase().includes(search.toLowerCase());
-    });
+    const filter = search.trim().toLowerCase();
+    const filtered = courses.filter((c) => !filter || c.title.toLowerCase().includes(filter) || c.code.toLowerCase().includes(filter));
+    const visibleInvites = showArchived ? [] : invites;
+
+    const selectArchiveView = (archived: boolean) => {
+        if (showArchived === archived) return;
+        setLoading(true);
+        setCourses([]);
+        setTotal(0);
+        setOffset(0);
+        setShowArchived(archived);
+    };
 
     // Admin CRUD
     const openCreate = () => {
@@ -199,8 +212,11 @@ export default function CoursesPage() {
                 toast.showToast('Course updated');
             } else {
                 const created = await api.post<CourseResponse>('/courses', payload);
-                setCourses((prev) => [mapCourse(created), ...prev]);
-                setTotal((t) => t + 1);
+                if (showArchived) selectArchiveView(false);
+                else {
+                    setCourses((prev) => [mapCourse(created), ...prev]);
+                    setTotal((t) => t + 1);
+                }
             }
             setShowModal(false);
         } catch (e) {
@@ -223,6 +239,24 @@ export default function CoursesPage() {
             const msg = e instanceof Error ? e.message : 'Failed to delete course';
             setError(msg);
             toast.showToast(msg, 'error');
+        }
+    };
+
+    const changeArchive = async () => {
+        if (!archiveTarget || archiveBusy) return;
+        const archived = !archiveTarget.archivedAt;
+        setArchiveBusy(true);
+        try {
+            await api.put(`/courses/${archiveTarget.id}/archive`, { archived });
+            setCourses((items) => items.filter((item) => item.id !== archiveTarget.id));
+            setOffset(0);
+            setReloadKey((key) => key + 1);
+            toast.showToast(archived ? 'Course archived' : 'Course restored');
+            setArchiveTarget(null);
+        } catch (error) {
+            toast.showToast(error instanceof Error ? error.message : 'Could not update the course', 'error');
+        } finally {
+            setArchiveBusy(false);
         }
     };
 
@@ -256,6 +290,12 @@ export default function CoursesPage() {
                     <input placeholder="Search courses..." value={search} onChange={(e) => setSearch(e.target.value)} />
                 </div>
                 <div className="courses-toolbar-right">
+                    <div className="courses-view-toggle" role="group" aria-label="Course status">
+                        <button type="button" className={!showArchived ? 'active' : ''} aria-pressed={!showArchived}
+                            onClick={() => selectArchiveView(false)}>Active</button>
+                        <button type="button" className={showArchived ? 'active' : ''} aria-pressed={showArchived}
+                            onClick={() => selectArchiveView(true)}>Archived</button>
+                    </div>
                     <div className="courses-view-toggle">
                         <button className={viewMode === 'grid' ? 'active' : ''} onClick={() => setViewMode('grid')}><Grid3X3 size={16} /></button>
                         <button className={viewMode === 'list' ? 'active' : ''} onClick={() => setViewMode('list')}><List size={16} /></button>
@@ -284,7 +324,7 @@ export default function CoursesPage() {
                 </div>
             ) : (
             <div className={`courses-grid ${viewMode}`}>
-                {invites.map((inv) => (
+                {visibleInvites.map((inv) => (
                     <div key={`invite-${inv.id}`} className={`course-card course-card-invite ${viewMode}`}>
                         <div className="course-card-thumb">
                             <span className="course-card-emoji">{inv.thumbnailEmoji || '📚'}</span>
@@ -321,6 +361,9 @@ export default function CoursesPage() {
                                 {isInstructor ? (
                                     <div className="course-card-admin-actions">
                                         <button className="btn btn-outline btn-sm" onClick={(ev) => { ev.stopPropagation(); openEdit(course); }}><Edit3 size={14} /> Edit</button>
+                                        <button type="button" className="btn btn-outline btn-sm" onClick={(ev) => { ev.stopPropagation(); setArchiveTarget(course); }}>
+                                            {course.archivedAt ? <><RotateCcw size={14} /> Restore</> : <><Archive size={14} /> Archive</>}
+                                        </button>
                                         {deleteConfirm === course.id ? (
                                             <div className="course-card-delete-confirm">
                                                 <span>Delete?</span>
@@ -346,11 +389,11 @@ export default function CoursesPage() {
             </div>
             )}
 
-            {!loading && filtered.length === 0 && invites.length === 0 && (
+            {!loading && filtered.length === 0 && visibleInvites.length === 0 && (
                 <div className="courses-empty">
                     <BookOpen size={48} />
                     <h3>No courses found</h3>
-                    <p>{isInstructor ? 'Try adjusting your search or filters' : 'Enter the class code from your teacher above to join a course'}</p>
+                    <p>{showArchived ? 'Archived courses appear here.' : isInstructor ? 'Try adjusting your search or filters' : 'Enter the class code from your teacher above to join a course'}</p>
                 </div>
             )}
             {!loading && total > 0 && (
@@ -358,6 +401,11 @@ export default function CoursesPage() {
             )}
 
             {/* Create / Edit Modal */}
+            <ConfirmModal open={archiveTarget !== null} title={archiveTarget?.archivedAt ? 'Restore course' : 'Archive course'}
+                message={archiveTarget?.archivedAt ? 'This course will return to Active Courses and accept new enrollments.' : 'The course will move to Archived Courses. Current students can still open it, and new enrollments will close.'}
+                confirmLabel={archiveTarget?.archivedAt ? 'Restore' : 'Archive'} variant="primary" loading={archiveBusy}
+                onConfirm={() => void changeArchive()} onCancel={() => { if (!archiveBusy) setArchiveTarget(null); }} />
+
             {showModal && (
                 <div className="course-modal-overlay" onClick={() => setShowModal(false)}>
                     <div className="course-modal animate-scale-in" onClick={(e) => e.stopPropagation()}>

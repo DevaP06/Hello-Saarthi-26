@@ -76,6 +76,37 @@ class QuizAttemptSubmitRequest(BaseModel):
     answers: List[QuizAnswer] = Field(default_factory=list)
 
 
+class QuizPracticeQuestion(BaseModel):
+    id: str
+    attemptId: int
+    revision: int
+    quizTitle: str
+    courseId: int | None = None
+    topic: str
+    difficulty: str
+    questionText: str
+    options: list[str]
+    dueAt: str
+    weakTopic: bool
+
+
+class QuizPracticeQueue(BaseModel):
+    items: list[QuizPracticeQuestion]
+    dueCount: int
+    nextReviewAt: str | None = None
+
+
+class QuizPracticeAnswer(BaseModel):
+    attemptId: int = Field(gt=0, le=2_147_483_647)
+    revision: int = Field(ge=0, le=2_147_483_646)
+    selectedIndex: int = Field(ge=0)
+
+
+class QuizPracticeFeedback(QuizAnswerResult):
+    source: str
+    nextReviewAt: str
+
+
 _DIFFICULTY = "^(recall|application|analysis)$"
 
 

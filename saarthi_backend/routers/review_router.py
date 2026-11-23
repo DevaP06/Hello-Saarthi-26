@@ -1,8 +1,9 @@
 """Instructor review queue for AI answers (under /api/reviews)."""
 
+from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -49,6 +50,76 @@ class ReviewStatsResponse(BaseModel):
     corrected: int = 0
     dismissed: int = 0
     total: int = 0
+
+
+class QueryLogItem(BaseModel):
+    id: str
+    conversationId: str
+    topic: str
+    query: str
+    answer: str | None = None
+    confidence: str | None = None
+    replyMode: str | None = None
+    rating: str | None = None
+    instructorNote: str | None = None
+    createdAt: str
+
+
+class FrequentQuery(BaseModel):
+    topic: str
+    query: str
+    count: int
+
+
+class QueryLogResponse(PaginatedResponse[QueryLogItem]):
+    frequent: list[FrequentQuery]
+
+
+class QueryNoteRequest(BaseModel):
+    note: str = Field(..., max_length=4000)
+
+
+@router.get("/queries", response_model=QueryLogResponse)
+async def list_course_queries(
+    courseId: int,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    pagination: Annotated[PaginationParams, Depends(get_pagination)],
+    topic: Annotated[str | None, Query(max_length=128)] = None,
+    onDate: date | None = None,
+):
+    await review_service.require_course_staff(db, user, courseId)
+    items, total, frequent = await review_service.course_query_log(
+        db, courseId, pagination.limit, pagination.offset, (topic or "").strip(), onDate,
+    )
+    return QueryLogResponse(items=items, total=total, limit=pagination.limit, offset=pagination.offset, frequent=frequent)
+
+
+@router.post("/queries/{query_id}/correct", response_model=CorrectionResponse)
+async def correct_course_query(
+    courseId: int,
+    query_id: int,
+    body: CorrectionRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await review_service.require_course_staff(db, user, courseId)
+    review = await review_service.correct_course_query(db, courseId, query_id, body.correction, user.id)
+    await db.commit()
+    return CorrectionResponse(review=ReviewResponse(**review_service.review_to_dict(review)),
+                              indexed=await review_service.index_correction(review))
+
+
+@router.patch("/queries/{query_id}/note")
+async def annotate_course_query(
+    courseId: int,
+    query_id: int,
+    body: QueryNoteRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await review_service.require_course_staff(db, user, courseId)
+    return {"instructorNote": await review_service.annotate_course_query(db, courseId, query_id, body.note)}
 
 
 @router.get("", response_model=PaginatedResponse[ReviewResponse])

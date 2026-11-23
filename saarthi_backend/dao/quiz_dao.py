@@ -84,6 +84,10 @@ class QuizQuestionDAO:
         q = await QuizQuestionDAO.get_by_id(db, question_id)
         if not q:
             return None
+        if any(value is not None and value != current for value, current in (
+            (question_text, q.question_text), (options_json, q.options_json), (correct_index, q.correct_index),
+        )):
+            q.revised_at = datetime.now(timezone.utc)
         if question_text is not None:
             q.question_text = question_text
         if options_json is not None:
