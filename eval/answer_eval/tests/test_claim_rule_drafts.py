@@ -2,38 +2,26 @@
 
 Run: python -m pytest eval/answer_eval/tests -q -p no:cacheprovider
 
-PATTERN-LEVEL TESTS ONLY. There is no production matcher (Phase 3) and the evaluation engine never
-reads the registry. `assess()` below is the single, explicit definition of how a draft rule is read.
-A later phase must implement these semantics deliberately; passing these tests says nothing about
-accuracy on real Saarthi responses, and no rule is approved.
+PATTERN-LEVEL TESTS of the draft rules. Since Phase 3, the matching semantics live in one place,
+eval/answer_eval/claim_matcher.py (see its module docstring), and these tests call it through thin
+adapters below; there is no second, test-local copy of the reader. The tables here (stored
+examples, decisive exclusions and anchors, bare values, realistic answers, pinned limitations)
+check that the draft rules behave as intended under those semantics. Passing them says nothing
+about accuracy on real Saarthi responses, and no rule is approved.
 
-Draft-rule semantics (what assess() does)
-1. Normalisation: Sprint 2 normalize_text (CRLF, NFC, NBSP, BOM/zero-width, spacing).
-2. Quoted text: spans inside "..." or “...” are blanked before matching. A quoted phrase is a
-   mention, not an assertion. Apostrophes and code are NOT blanked.
-3. Sentences: split after . ! ? followed by whitespace (or end), and at newlines. A full stop after
-   a known abbreviation (approx, e.g, i.e, vs, etc, fig, eq, cf, resp, no, ca, al) does not end a
-   sentence. Decimal points never do (no whitespace follows them).
-4. Clauses: a sentence is split into clauses only at strong boundaries: ";"; a spaced dash
-   (" — ", " – ", or " - " before a letter); before a parenthetical that opens with a word
-   (" (commonly"); before a comma + connective (but, though, although, however, whereas, yet, so,
-   hence, thus, which, since, because, while, not); before a spaced but/though/although/whereas/
-   however. Commas inside code or maths such as alias_frequency(9000, 12000) are not boundaries.
-5. Matching: every match of the rule's pattern in a sentence is assessed, case-insensitively
-   (re.IGNORECASE is applied by the reader; patterns carry no flags).
-6. Anchors: ALL anchors must match somewhere in the same sentence (case-insensitive).
-7. Exclusions: each exclusion starts with a regex comment naming it and, optionally, its scope:
-   "(?#name)" applies to the claim clause (the whole clause containing the match, matched text
-   included, so a negation captured inside a match such as "France never won" still counts);
-   "(?#name;next-clause)" applies only to the clause immediately after it (a trailing rejection
-   such as ", which is wrong"). Exclusions never look at other clauses or sentences.
-8. Outcome per match: "no_anchor" if an anchor fails; else "excluded" if any exclusion fires; else
-   "candidate" (an affirmative assertion of the claim). A text is a candidate if any match is.
-9. Ambiguity: when the claim clause carries negation, correction, a question, a reported claim
-   (false claims only) or an explicit hypothetical (false claims only), the match is NOT flagged.
-   This is deliberate: a missed detection is preferred to accusing a correct answer. Unsupported
-   claims (abstain items) do not exclude reported or hypothetical wording, because relaying or
-   hypothesising uncovered content still leaks it.
+Semantics in brief (authoritative text: claim_matcher.py)
+1. Normalise (Sprint 2 normaliser); blank "..." / “...” quoted spans; apostrophes and code stay.
+2. Sentences end after . ! ? + whitespace and at newlines; a full stop after approx, e.g, i.e, vs,
+   etc, fig, eq, cf, resp, ca, al never ends one; "No."/"no." only when a number follows (D5).
+3. Clauses split only at strong boundaries (";", spaced dashes, a parenthetical opening with a word,
+   comma + connective, spaced but/though/although/whereas/however).
+4. Patterns match case-insensitively; ALL anchors must match in the same sentence.
+5. Exclusions are named "(?#name)" (claim scope: every clause the match touches, matched text
+   included; D4) or "(?#name;next-clause)" (only the clause after the last touched clause).
+6. Outcome: no_anchor, else excluded, else affirmative. Excluded matches are never detections:
+   negation, correction, questions, reported claims (false claims only) and explicit hypotheticals
+   (false claims only) are resolved conservatively. Unsupported claims do not exclude reported or
+   hypothetical wording, because relaying uncovered content still leaks it.
 """
 from __future__ import annotations
 
@@ -50,10 +38,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from eval.answer_eval import review_claim_rules  # noqa: E402
+from eval.answer_eval.claim_matcher import (  # noqa: E402
+    assess_rule, parse_exclusion_name, prepare_text, split_clauses, split_sentences,
+)
 from eval.answer_eval.claim_rules import (  # noqa: E402
     NEGATION_CUE, REGISTRY_PATH, dataset_claims, load_registry, parse_registry,
 )
-from eval.answer_eval.response_normalizer import normalize_text  # noqa: E402
 from eval.answer_eval.schema import load_dataset  # noqa: E402
 
 PKG = Path(__file__).resolve().parents[1]
@@ -77,54 +67,12 @@ SHARED_FALSE = ("negation", "correction", "reported", "question", "hypothetical"
 SHARED_UNSUPPORTED = ("negation", "correction", "question", "rejected-after")
 
 
-# ── The reader (test-local; see module docstring) ───────────────────────────────────────────
-
-ABBREVIATIONS = ("approx", "e.g", "i.e", "vs", "etc", "fig", "eq", "cf", "resp", "no", "ca", "al")
-_END = re.compile(r"[.!?]+(?=\s|$)|\n+")
-_QUOTED = re.compile(r"\"[^\"\n]*\"|“[^”\n]*”")
-_CLAUSE = re.compile(
-    r"\s*;\s*"
-    r"|\s+[—–]\s+|\s+-{1,2}\s+(?=[A-Za-z])"
-    r"|\s+(?=\([A-Za-z]{2,})"
-    r"|,\s*(?=(?:but|though|although|however|whereas|yet|so|hence|thus|which|since|because|while|not)\b)"
-    r"|\s+(?=(?:but|though|although|whereas|however)\s)", re.I)
-_TAG = re.compile(r"^\(\?#([a-z0-9-]+)(?:;(next-clause))?\)")
-
-
-def sentences(text: str) -> list[str]:
-    t = _QUOTED.sub(lambda m: " " * len(m.group(0)), normalize_text(text))
-    out, start = [], 0
-    for m in _END.finditer(t):
-        if m.group(0).startswith("."):
-            word = re.search(r"([A-Za-z.]+)$", t[start:m.start()])
-            if word and word.group(1).lower().rstrip(".") in ABBREVIATIONS:
-                continue
-        if t[start:m.end()].strip():
-            out.append(t[start:m.end()].strip())
-        start = m.end()
-    if t[start:].strip():
-        out.append(t[start:].strip())
-    return out
-
-
-def clauses(sentence: str) -> list[tuple[int, int]]:
-    spans, start = [], 0
-    for m in _CLAUSE.finditer(sentence):
-        if m.start() > start:
-            spans.append((start, m.start()))
-        start = m.end()
-    spans.append((start, len(sentence)))
-    return [(a, b) for a, b in spans if sentence[a:b].strip()]
-
-
-def exclusion_tag(exclusion: str) -> tuple[str | None, str]:
-    m = _TAG.match(exclusion)
-    return (m.group(1), m.group(2) or "clause") if m else (None, "clause")
-
+# ── Adapters over the production matcher (no test-local matching logic) ───────────────────
 
 @dataclass
 class Decision:
-    outcome: str                 # candidate | excluded | no_anchor
+    """A list-based view of claim_matcher.Assessment, for readable assertions."""
+    outcome: str                 # affirmative | excluded | no_anchor
     sentence: str
     match: str
     clause: str
@@ -132,29 +80,29 @@ class Decision:
     fired: list[str] = field(default_factory=list)
 
 
+def sentences(text: str) -> list[str]:
+    return [s.text for s in split_sentences(prepare_text(text))]
+
+
+def clauses(sentence: str) -> list[tuple[int, int]]:
+    return [(c.start, c.end) for c in split_clauses(sentence)]
+
+
+def exclusion_tag(exclusion: str) -> tuple[str | None, str]:
+    try:
+        return parse_exclusion_name(exclusion)
+    except ValueError:
+        return None, "clause"
+
+
 def assess(rule: dict, text: str) -> list[Decision]:
-    out = []
-    for s in sentences(text):
-        spans = clauses(s)
-        for m in re.finditer(rule["pattern"], s, re.I):
-            failed = [i for i, a in enumerate(rule["anchors"]) if not re.search(a, s, re.I)]
-            idx = next((i for i, (a, b) in enumerate(spans) if a <= m.start() < b), len(spans) - 1)
-            a, b = spans[idx]
-            claim_clause = s[a:b]
-            following = s[spans[idx + 1][0]:spans[idx + 1][1]] if idx + 1 < len(spans) else ""
-            fired = []
-            for ex in rule["exclusions"]:
-                tag, scope = exclusion_tag(ex)
-                target = following if scope == "next-clause" else claim_clause
-                if target and re.search(ex, target, re.I):
-                    fired.append(tag)
-            outcome = "no_anchor" if failed else ("excluded" if fired else "candidate")
-            out.append(Decision(outcome, s, m.group(0), s[a:b], failed, fired))
-    return out
+    return [Decision(a.outcome, a.sentence.text, a.match.text, a.clause.text, list(a.failed_anchors),
+                     list(a.exclusion_names)) for a in assess_rule(rule, text)]
 
 
 def is_candidate(rule: dict, text: str) -> bool:
-    return any(d.outcome == "candidate" for d in assess(rule, text))
+    """True if any match of the rule in the text is affirmative."""
+    return any(a.is_affirmative for a in assess_rule(rule, text))
 
 
 def without_exclusion(rule: dict, tag: str) -> dict:
@@ -204,7 +152,7 @@ def test_matching_is_case_insensitive():
 def test_exclusion_scope_is_the_claim_clause_only():
     r = RULES["df-03#c1"]
     d = assess(r, "The period is 50 ms, so it does not depend on the amplitude.")[0]
-    assert d.outcome == "candidate" and d.fired == []
+    assert d.outcome == "affirmative" and d.fired == []
     d = assess(r, "The period is not 50 ms, so the amplitude is irrelevant.")[0]
     assert d.outcome == "excluded" and d.fired == ["negation"]
 
