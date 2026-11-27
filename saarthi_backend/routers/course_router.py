@@ -3,7 +3,7 @@
 import json
 import mimetypes
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from urllib.parse import quote
@@ -134,6 +134,49 @@ def _due_at(due_date: str) -> datetime | None:
         return due if due.tzinfo else due.replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+def _require_future_due(due_date: str) -> None:
+    """A due date being set must be a valid date that is not in the past (1 minute of slack for clock skew)."""
+    due = _due_at(due_date)
+    if due is None:
+        raise ValidationError("Invalid due date.", details=None)
+    if due < datetime.now(timezone.utc) - timedelta(minutes=1):
+        raise ValidationError("The due date cannot be in the past.", details=None)
+
+
+_MAX_ASSIGNMENT_ATTACHMENTS = 20
+
+
+def _clean_attachments(raw: str | None) -> str | None:
+    """Teacher's assignment attachments: a JSON list of {name, url}. A url is either an uploaded file
+    ("/uploads/<file>") or an http(s) link, so no javascript: or data: URL reaches students' browsers.
+    Returns the normalised JSON (None for an empty list)."""
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return ""
+    try:
+        items = json.loads(raw)
+    except ValueError:
+        raise ValidationError("Attachments must be a JSON list.", details=None)
+    if not isinstance(items, list):
+        raise ValidationError("Attachments must be a JSON list.", details=None)
+    if len(items) > _MAX_ASSIGNMENT_ATTACHMENTS:
+        raise ValidationError(f"At most {_MAX_ASSIGNMENT_ATTACHMENTS} attachments.", details=None)
+    clean = []
+    for it in items:
+        if not isinstance(it, dict):
+            raise ValidationError("Each attachment needs a name and a url.", details=None)
+        url = str(it.get("url") or "").strip()
+        name = str(it.get("name") or "").strip()[:200] or url[:200]
+        is_upload = url.startswith("/uploads/") and ".." not in url
+        is_link = url.lower().startswith(("http://", "https://")) and len(url) <= 2000
+        if not (is_upload or is_link):
+            raise ValidationError("An attachment must be an uploaded file or an http(s) link.", details=None)
+        clean.append({"name": name, "url": url})
+    return json.dumps(clean) if clean else ""
 
 
 def _closed_for_submissions(assignment) -> bool:
@@ -700,6 +743,7 @@ async def create_assignment(
     if not course:
         raise NotFoundError("Course not found.", details=None)
     _require_course_owner(user, course)
+    _require_future_due(body.dueDate)
     a = await course_service.create_assignment(
         db,
         course_id=course_id,
@@ -708,7 +752,7 @@ async def create_assignment(
         description=body.description,
         points=body.points,
         topic=body.topic,
-        attachments=body.attachments,
+        attachments=_clean_attachments(body.attachments),
     )
     a.hard_deadline = body.hardDeadline
     await course_service.create_stream_item(
@@ -739,6 +783,9 @@ async def update_assignment(
     assignment = await course_service.get_assignment(db, assignment_id)
     if not assignment or assignment.course_id != course_id:
         raise NotFoundError("Assignment not found.", details=None)
+    # Changing the due date must move it to now or later; keeping the old one (even past) is fine.
+    if body.dueDate is not None and _due_at(body.dueDate) != _due_at(assignment.due_date):
+        _require_future_due(body.dueDate)
     updated = await course_service.update_assignment(
         db,
         assignment_id,
@@ -747,7 +794,7 @@ async def update_assignment(
         due_date=body.dueDate,
         points=body.points,
         topic=body.topic,
-        attachments=body.attachments,
+        attachments=_clean_attachments(body.attachments),
     )
     if body.hardDeadline is not None:
         updated.hard_deadline = body.hardDeadline

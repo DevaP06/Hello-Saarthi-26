@@ -1,3 +1,25 @@
+/** A file or link the teacher attached to an assignment. */
+export interface AssignmentAttachment { name: string; url: string }
+
+/** Only uploaded files and http(s) links are opened (never javascript: or data: URLs). */
+export function isSafeAttachmentUrl(url: string): boolean {
+    return url.startsWith('/uploads/') || /^https?:\/\//i.test(url);
+}
+
+/** Stored as a JSON list of {name, url}; older rows may hold one plain url. */
+export function parseAssignmentAttachments(raw: string | null | undefined): AssignmentAttachment[] {
+    if (!raw?.trim()) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+            return parsed
+                .filter((x) => x && typeof x.url === 'string' && isSafeAttachmentUrl(x.url))
+                .map((x) => ({ name: String(x.name || x.url), url: x.url }));
+        }
+    } catch { /* plain url below */ }
+    return isSafeAttachmentUrl(raw.trim()) ? [{ name: raw.trim(), url: raw.trim() }] : [];
+}
+
 /** A date-only due date (older assignments) counts until the end of that day. */
 export function dueTime(dueDate: string): number {
     const iso = /^\d{4}-\d{2}-\d{2}$/.test(dueDate) ? `${dueDate}T23:59:59` : dueDate;

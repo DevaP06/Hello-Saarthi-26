@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { FileText, X, Paperclip, Plus, Lock } from 'lucide-react';
+import { FileText, X, Paperclip, Plus, Lock, Link2 } from 'lucide-react';
 import { api, getUploadFullUrl, uploadFile, type SubmissionResponse } from '../lib/api';
-import { formatDue, isClosed, parseFiles, statusLabel, dueTime } from '../lib/assignmentStatus';
+import { formatDue, isClosed, parseFiles, statusLabel, dueTime, type AssignmentAttachment } from '../lib/assignmentStatus';import { attachmentHref } from './AssignmentAttachmentsField';
 import { useToast } from './Toast';
 
 export interface AssignmentDialogItem {
@@ -15,6 +15,8 @@ export interface AssignmentDialogItem {
     grade?: number | null;
     submittedAt?: string | null;
     attachmentUrl?: string | null;
+    /** Files and links the teacher attached. */
+    attachments?: AssignmentAttachment[];
 }
 
 interface Props {
@@ -156,6 +158,18 @@ export default function AssignmentDialog({ courseId, assignment, isInstructor, o
                     {assignment.description
                         ? <p className="cd-assignment-desc">{assignment.description}</p>
                         : <p className="cd-assignment-meta">No instructions.</p>}
+
+                    {!!assignment.attachments?.length && (
+                        <ul className="cd-work-files" aria-label="Attachments">
+                            {assignment.attachments.map((a, i) => (
+                                <li key={`${a.url}-${i}`}>
+                                    <a href={attachmentHref(a.url)} target="_blank" rel="noopener noreferrer" className="cd-assignment-file">
+                                        {a.url.startsWith('/') ? <Paperclip size={14} /> : <Link2 size={14} />} {a.name}
+                                    </a>
+                                </li>
+                            ))}
+                        </ul>
+                    )}
 
                     {!isInstructor && (
                         <section className="cd-assignment-work">

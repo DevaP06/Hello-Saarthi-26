@@ -13,7 +13,8 @@ import QuizEditor from '../components/QuizEditor';
 import MaterialIndexBadge from '../components/MaterialIndexBadge';
 import CourseSyllabus from '../components/CourseSyllabus';
 import ModulePrerequisites from '../components/ModulePrerequisites';
-import { formatDue, isClosed, statusLabel, toDateTimeLocal } from '../lib/assignmentStatus';
+import { formatDue, isClosed, isSafeAttachmentUrl, parseAssignmentAttachments, statusLabel, toDateTimeLocal, type AssignmentAttachment } from '../lib/assignmentStatus';
+import AssignmentAttachmentsField from '../components/AssignmentAttachmentsField';
 import { api, authFetch, getAllPages, uploadFile, getUploadFullUrl, getMaterialFileUrl, type CourseResponse, type PaginatedResponse, type AssignmentResponse, type MaterialResponse, type StreamItemResponse, type CoursePersonResponse, type VideoResponse, type ModuleResponse, type BookmarkResponse, type QuizResponse } from '../lib/api';
 import Pagination from '../components/Pagination';
 import FileDropzone from '../components/FileDropzone';
@@ -41,7 +42,7 @@ interface Assignment {
     points: number;
     status: 'pending' | 'submitted' | 'graded';
     grade?: number;
-    attachments: string[];
+    attachments: AssignmentAttachment[];
     createdAt: string;
     topic: string;
     submittedAt?: string | null;
@@ -125,7 +126,7 @@ function mapAssignment(a: AssignmentResponse): Assignment {
         points: a.points,
         status: (a.status as Assignment['status']) || 'pending',
         grade: a.grade,
-        attachments: a.attachments ? [a.attachments] : [],
+        attachments: parseAssignmentAttachments(a.attachments),
         createdAt: a.createdAt,
         topic: a.topic ?? 'No topic',
         submittedAt: a.submittedAt,
@@ -571,14 +572,28 @@ export default function CourseDetailPage() {
                 toast.showToast('Title and due date are required', 'error');
                 return;
             }
+            // A new due date must not be in the past; an unchanged old one may stay when editing.
+            const dueChanged = !editItem || formData.dueLocal !== toDateTimeLocal(editItem.dueDate);
+            if (dueChanged && new Date(formData.dueLocal).getTime() < Date.now() - 60_000) {
+                toast.showToast('The due date cannot be in the past', 'error');
+                return;
+            }
+            // A link typed in the box but not added with "Add link" is still attached.
+            const attachments: AssignmentAttachment[] = [
+                ...((formData.attachments as AssignmentAttachment[] | undefined) ?? []),
+                ...(formData.pendingLink ? [formData.pendingLink as AssignmentAttachment] : []),
+            ];
             try {
                 const topic = formData.topic && formData.topic !== 'No topic' ? formData.topic : undefined;
                 const payload = {
                     title: formData.title.trim(),
                     description: formData.description?.trim() || undefined,
                     // Store the exact moment (with time zone) so the server can enforce a hard deadline.
-                    dueDate: new Date(formData.dueLocal).toISOString(),
+                    // An unchanged due date is sent back as stored, so the server sees no change.
+                    dueDate: dueChanged ? new Date(formData.dueLocal).toISOString() : editItem.dueDate,
                     hardDeadline: !!formData.hardDeadline,
+                    // Empty string clears them on edit.
+                    attachments: attachments.length ? JSON.stringify(attachments) : '',
                     points: formData.points || 100,
                     topic,
                 };
@@ -898,7 +913,10 @@ export default function CourseDetailPage() {
         // Material posts made before the id was stored: find the material by title.
         const legacy: NonNullable<StreamItem['attachments']> = item.type === 'material' && !item.attachments?.length
             ? materials.filter((m) => m.title === item.description).slice(0, 1).map((m) => ({ name: m.title, materialId: m.id }))
-            : [];
+            // Assignment posts store only the title: show that assignment's current files and links.
+            : item.type === 'assignment' && !item.attachments?.length
+                ? (assignments.find((a) => a.title === item.description)?.attachments ?? [])
+                : [];
         const atts = item.attachments?.length ? item.attachments : legacy;
         if (atts.length === 0) return null;
         return (
@@ -918,11 +936,14 @@ export default function CourseDetailPage() {
                     if (!att.url) return null; // material since deleted
                     // Older posts store "/uploads/x" without the API host.
                     const href = att.url.startsWith('/') ? getUploadFullUrl(att.url) : att.url;
-                    const isImage = /\.(png|jpe?g|gif|webp)$/i.test(att.url);
+                    if (!isSafeAttachmentUrl(att.url)) return null;
+                    // Announcement uploads are stored as full URLs, so "uploaded" means an /uploads/ path.
+                    const isUpload = att.url.startsWith('/uploads/') || att.url.includes('/uploads/');
+                    const isImage = isUpload && /\.(png|jpe?g|gif|webp)$/i.test(att.url);
                     return (
                         <a key={i} href={href} target="_blank" rel="noopener noreferrer" className="cd-feed-attachment" onClick={(e) => e.stopPropagation()}>
                             {isImage && <img src={href} alt={att.name} className="cd-feed-attachment-img" loading="lazy" />}
-                            <span className="cd-feed-attachment-name"><Paperclip size={13} /> {att.name}</span>
+                            <span className="cd-feed-attachment-name">{isUpload ? <Paperclip size={13} /> : <LinkIcon size={13} />} {att.name}</span>
                         </a>
                     );
                 })}
@@ -1378,7 +1399,7 @@ export default function CourseDetailPage() {
                                 <div className="cd-modal-row">
                                     <div className="cd-modal-field">
                                         <label>Due *</label>
-                                        <input className="input" type="datetime-local" value={formData.dueLocal || ''} onChange={(e) => setFormData({ ...formData, dueLocal: e.target.value })} />
+                                        <input className="input" type="datetime-local" min={toDateTimeLocal(new Date().toISOString())} value={formData.dueLocal || ''} onChange={(e) => setFormData({ ...formData, dueLocal: e.target.value })} />
                                     </div>
                                     <div className="cd-modal-field">
                                         <label>Points</label>
@@ -1394,6 +1415,13 @@ export default function CourseDetailPage() {
                                         <small>Off: late work is accepted and marked late.</small>
                                     </span>
                                 </label>
+                            )}
+                            {modalType === 'assignment' && (
+                                <AssignmentAttachmentsField
+                                    value={formData.attachments || []}
+                                    onChange={(next) => setFormData((prev: Record<string, unknown>) => ({ ...prev, attachments: next }))}
+                                    onPendingLinkChange={(link) => setFormData((prev: Record<string, unknown>) => ({ ...prev, pendingLink: link }))}
+                                />
                             )}
 
                             {modalType === 'material' && (
