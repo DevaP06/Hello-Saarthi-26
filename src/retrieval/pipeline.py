@@ -1,5 +1,6 @@
 """search_index(): the hybrid search used by src.tools.retrieve for one index folder."""
 from __future__ import annotations
+from src.retrieval.query_expansion import expand_query
 
 import logging
 import os
