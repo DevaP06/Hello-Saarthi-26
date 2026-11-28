@@ -14,6 +14,7 @@ import csv
 import io
 import json
 import os
+import math
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from statistics import median
@@ -101,7 +102,133 @@ def _graded_answers(attempt: QuizAttempt, quiz: Quiz, questions: dict[str, QuizQ
             continue
         topic = q.topic or quiz.topic or "General"
         yield q, topic, a.get("selectedIndex") == q.correct_index
+        
+def _topic_mastery(
+    observations: list[tuple[bool, str, datetime]],
+    now: datetime,
+) -> dict:
+    """
+    Predict topic mastery using:
+    1. Answer correctness
+    2. Question difficulty
+    3. Recency of practice
+    4. Number of questions attempted
+    5. Improvement or decline in performance
+    """
 
+    if not observations:
+        return {
+            "masteryScore": None,
+            "masteryLevel": "not_assessed",
+            "confidence": "none",
+            "trend": "insufficient_data",
+            "evidenceCount": 0,
+            "lastPracticedAt": None,
+        }
+
+    weighted_correct = 0.0
+    total_weight = 0.0
+
+    processed = []
+
+    difficulty_weights = {
+        "recall": 1.0,
+        "application": 1.1,
+        "analysis": 1.25,
+    }
+
+    for correct, difficulty, submitted_at in observations:
+
+        timestamp = submitted_at
+
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+        age_days = max(
+            0.0,
+            (now - timestamp.astimezone(timezone.utc)).total_seconds() / 86400,
+        )
+
+        # Older attempts contribute less.
+        recency_weight = math.exp(-age_days / 90.0)
+
+        # Harder questions contribute slightly more.
+        difficulty_weight = difficulty_weights.get(
+            (difficulty or "recall").lower(),
+            1.0,
+        )
+
+        weight = recency_weight * difficulty_weight
+
+        weighted_correct += weight * int(correct)
+        total_weight += weight
+
+        processed.append((timestamp, bool(correct)))
+
+    # Weighted accuracy.
+    accuracy = weighted_correct / total_weight if total_weight else 0.5
+
+    evidence_count = len(processed)
+
+    # Reduce confidence when there are very few answers.
+    confidence_factor = min(1.0, evidence_count / 8.0)
+
+    # Shrink scores towards 50 when evidence is insufficient.
+    mastery_score = (
+        50.0 + (accuracy * 100.0 - 50.0) * confidence_factor
+    )
+
+    # Mastery classification.
+    if mastery_score < 40:
+        mastery_level = "beginner"
+    elif mastery_score < 60:
+        mastery_level = "developing"
+    elif mastery_score < 80:
+        mastery_level = "proficient"
+    else:
+        mastery_level = "mastered"
+
+    # Performance trend.
+    if evidence_count < 4:
+        trend = "insufficient_data"
+    else:
+        processed.sort(key=lambda item: item[0])
+
+        midpoint = len(processed) // 2
+
+        earlier = processed[:midpoint]
+        recent = processed[midpoint:]
+
+        earlier_accuracy = sum(ok for _, ok in earlier) / len(earlier)
+        recent_accuracy = sum(ok for _, ok in recent) / len(recent)
+
+        difference = recent_accuracy - earlier_accuracy
+
+        if difference >= 0.1:
+            trend = "improving"
+        elif difference <= -0.1:
+            trend = "declining"
+        else:
+            trend = "stable"
+
+    # Confidence classification.
+    if evidence_count < 3:
+        confidence = "low"
+    elif evidence_count < 8:
+        confidence = "medium"
+    else:
+        confidence = "high"
+
+    last_practiced = max(timestamp for timestamp, _ in processed)
+
+    return {
+        "masteryScore": round(mastery_score, 1),
+        "masteryLevel": mastery_level,
+        "confidence": confidence,
+        "trend": trend,
+        "evidenceCount": evidence_count,
+        "lastPracticedAt": last_practiced.isoformat(),
+    }
 
 # ── Streak ──────────────────────────────────────────────────────────────────
 
@@ -190,28 +317,98 @@ async def student_analytics(db: AsyncSession, user: User) -> dict:
     )).all()
 
     # Per topic and per difficulty accuracy.
-    topic_stats: dict[tuple[int, str], list[int]] = defaultdict(lambda: [0, 0])
-    diff_stats: dict[str, list[int]] = defaultdict(lambda: [0, 0])
-    for attempt, quiz in mine:
-        for q, topic, ok in _graded_answers(attempt, quiz, questions):
-            topic_stats[(quiz.course_id, topic)][0] += int(ok)
-            topic_stats[(quiz.course_id, topic)][1] += 1
-            diff_stats[q.difficulty or "recall"][0] += int(ok)
-            diff_stats[q.difficulty or "recall"][1] += 1
+
+    topic_stats: dict[tuple[int, str], list[int]] = defaultdict(
+    lambda: [0, 0]
+)
+
+topic_observations: dict[
+    tuple[int, str],
+    list[tuple[bool, str, datetime]]
+] = defaultdict(list)
+
+diff_stats: dict[str, list[int]] = defaultdict(
+    lambda: [0, 0]
+)
+
+for attempt, quiz in mine:
+
+    for q, topic, ok in _graded_answers(attempt, quiz, questions):
+
+        topic_key = (quiz.course_id, topic)
+
+        topic_stats[topic_key][0] += int(ok)
+        topic_stats[topic_key][1] += 1
+
+        if attempt.submitted_at is not None:
+            topic_observations[topic_key].append(
+                (
+                    ok,
+                    q.difficulty or "recall",
+                    attempt.submitted_at,
+                )
+            )
+
+        diff_stats[q.difficulty or "recall"][0] += int(ok)
+        diff_stats[q.difficulty or "recall"][1] += 1
+        
     for submission, problem in code_rows:
         if problem.course_id in title and submission.total:
             score = topic_stats[(problem.course_id, problem.topic or "General")]
             score[0] += submission.passed
             score[1] += submission.total
 
-    topics = sorted(
-        (
-            {"topic": t, "courseId": str(cid), "course": title.get(cid, ""), "correct": c, "total": n,
-             "accuracy": _r(c * 100 / n)}
-            for (cid, t), (c, n) in topic_stats.items() if n
-        ),
-        key=lambda x: x["accuracy"],
-    )
+    now = datetime.now(timezone.utc)
+
+topics = sorted(
+    (
+        {
+            "topic": topic,
+            "courseId": str(course_id),
+            "course": title.get(course_id, ""),
+            "correct": correct,
+            "total": total,
+            "accuracy": _r(correct * 100 / total),
+
+            **_topic_mastery(
+                topic_observations[(course_id, topic)],
+                now,
+            ),
+        }
+
+        for (course_id, topic), (correct, total)
+        in topic_stats.items()
+
+        if total
+    ),
+
+    key=lambda item: (
+        item["masteryScore"]
+        if item["masteryScore"] is not None
+        else -1
+    ),
+)
+
+mastery = [
+    {
+        key: value
+        for key, value in topic.items()
+
+        if key in {
+            "topic",
+            "courseId",
+            "course",
+            "masteryScore",
+            "masteryLevel",
+            "confidence",
+            "trend",
+            "evidenceCount",
+            "lastPracticedAt",
+        }
+    }
+
+    for topic in topics
+]
 
     # Weak topics with notes to read and a quiz to retry.
     quiz_by_topic = {}
@@ -362,6 +559,7 @@ async def student_analytics(db: AsyncSession, user: User) -> dict:
             "activeDays30": sum(1 for d in days if d >= since),
         },
         "topics": topics,
+        "mastery": mastery,
         "difficulty": [
             {"level": lvl, "correct": diff_stats[lvl][0], "total": diff_stats[lvl][1],
              "accuracy": _r(diff_stats[lvl][0] * 100 / diff_stats[lvl][1]) if diff_stats[lvl][1] else None}
