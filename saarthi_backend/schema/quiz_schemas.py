@@ -142,9 +142,12 @@ class QuizCreate(BaseModel):
     questions: List[QuizQuestionCreate] = Field(..., min_length=1, max_length=100)
 
 
+
 # ─── Adaptive Quiz Generation ─────────────────────────────────────────────────
 
 class PastAttemptSummary(BaseModel):
+    # Retained for backward compatibility.
+    # The backend does not trust this data for adaptive decisions.
     quizTitle: str
     score: float
     answersJson: str = "[]"
@@ -152,9 +155,17 @@ class PastAttemptSummary(BaseModel):
 
 
 class AdaptiveQuizRequest(BaseModel):
-    topic: str = Field(..., description="Subject/topic to generate quiz on, e.g. 'Z-transform'")
+    topic: str = Field(
+        ...,
+        min_length=2,
+        max_length=128,
+        description="Subject/topic to generate quiz questions on.",
+    )
     courseTitle: Optional[str] = None
-    difficulty: Optional[str] = Field(None, description="easy | medium | hard | auto")
+    difficulty: Optional[str] = Field(
+        "auto",
+        pattern="^(easy|easy-medium|medium|medium-hard|hard|auto)$",
+    )
     numQuestions: int = Field(default=10, ge=3, le=20)
     pastAttempts: List[PastAttemptSummary] = Field(default_factory=list)
 
@@ -162,9 +173,9 @@ class AdaptiveQuizRequest(BaseModel):
 class GeneratedQuizQuestion(BaseModel):
     questionText: str
     options: List[str]
-    correctIndex: int
+    correctIndex: int = Field(ge=0, le=3)
     explanation: str
-    difficulty: str  # "easy" | "medium" | "hard"
+    difficulty: str
     topic: str
 
 
@@ -175,8 +186,10 @@ class AdaptiveQuizResponse(BaseModel):
     questions: List[GeneratedQuizQuestion]
     weakAreasDetected: List[str]
     generatedAt: str
-
-
+    averageScore: Optional[float] = None
+    attemptsAnalyzed: int = 0
+    difficultyBreakdown: dict[str, int] = Field(default_factory=dict)
+    
 # ─── Peer Comparison ──────────────────────────────────────────────────────────
 
 class ScoreBucket(BaseModel):
