@@ -164,33 +164,172 @@ async def delete_question(
 
 # ─── Adaptive Quiz Generation ─────────────────────────────────────────────────
 
-_QUIZ_GEN_SYSTEM = """You are an expert engineering professor creating adaptive quiz questions.
-Analyze the student's past performance and generate targeted questions.
+def _topic_matches(value: str | None, requested_topic: str) -> bool:
+    """Case-insensitive topic matching with partial-name support."""
+    if not value:
+        return False
+    value = value.strip().casefold()
+    requested = requested_topic.strip().casefold()
+    return requested in value or value in requested
 
-Return ONLY valid JSON with this structure:
+
+async def _get_adaptive_performance(
+    db: AsyncSession,
+    user_id: int,
+    requested_topic: str,
+    limit: int = 5,
+) -> dict:
+    """
+    Build a performance profile from the authenticated student's own
+    submitted attempts. Client-supplied pastAttempts are deliberately ignored.
+    """
+    result = await db.execute(
+        select(QuizAttempt, Quiz)
+        .join(Quiz, Quiz.id == QuizAttempt.quiz_id)
+        .where(
+            QuizAttempt.user_id == user_id,
+            QuizAttempt.submitted_at.is_not(None),
+            QuizAttempt.score.is_not(None),
+        )
+        .order_by(QuizAttempt.submitted_at.desc(), QuizAttempt.id.desc())
+        .limit(30)
+    )
+
+    attempts = []
+    topic_stats: dict[str, dict[str, int]] = {}
+
+    for attempt, quiz in result.all():
+        questions_result = await db.execute(
+            select(QuizQuestion).where(QuizQuestion.quiz_id == quiz.id)
+        )
+        questions = questions_result.scalars().all()
+
+        quiz_matches = (
+            _topic_matches(quiz.topic, requested_topic)
+            or _topic_matches(quiz.title, requested_topic)
+        )
+
+        try:
+            answer_rows = json.loads(attempt.answers_json or "[]")
+        except (TypeError, ValueError):
+            answer_rows = []
+
+        if not isinstance(answer_rows, list):
+            continue
+
+        answers = {
+            str(row.get("questionId")): row.get("selectedIndex")
+            for row in answer_rows
+            if isinstance(row, dict) and row.get("questionId") is not None
+        }
+
+        relevant_questions = []
+        for question in questions:
+            question_topic = question.topic or quiz.topic or quiz.title
+
+            if quiz_matches or _topic_matches(question_topic, requested_topic):
+                relevant_questions.append((question, question_topic))
+
+        if not relevant_questions:
+            continue
+
+        answered_count = 0
+        correct_count = 0
+
+        for question, question_topic in relevant_questions:
+            question_id = str(question.id)
+            if question_id not in answers:
+                continue
+
+            answered_count += 1
+            is_correct = answers[question_id] == question.correct_index
+            correct_count += int(is_correct)
+
+            key = question_topic.strip() or "General"
+            stats = topic_stats.setdefault(key, {"correct": 0, "total": 0})
+            stats["total"] += 1
+            stats["correct"] += int(is_correct)
+
+        if answered_count:
+            attempts.append({
+                "title": quiz.title,
+                "score": float(attempt.score),
+                "submitted_at": attempt.submitted_at.isoformat(),
+            })
+
+        if len(attempts) >= limit:
+            break
+
+    scores = [item["score"] for item in attempts]
+    average_score = round(sum(scores) / len(scores), 1) if scores else None
+
+    weak_areas = [
+        name
+        for name, stats in topic_stats.items()
+        if stats["total"] >= 1
+        and stats["correct"] / stats["total"] < 0.70
+    ]
+
+    topic_performance = {
+        name: {
+            "accuracy": round(stats["correct"] / stats["total"] * 100, 1),
+            "correct": stats["correct"],
+            "total": stats["total"],
+        }
+        for name, stats in topic_stats.items()
+    }
+
+    return {
+        "attempts": attempts,
+        "average_score": average_score,
+        "attempts_analyzed": len(attempts),
+        "weak_areas": weak_areas,
+        "topic_performance": topic_performance,
+    }
+
+
+def _select_adaptive_difficulty(average_score: float | None) -> str:
+    """Choose a conservative target difficulty from recent performance."""
+    if average_score is None:
+        return "medium"
+    if average_score < 40:
+        return "easy"
+    if average_score < 60:
+        return "easy-medium"
+    if average_score < 80:
+        return "medium"
+    if average_score < 90:
+        return "medium-hard"
+    return "hard"
+
+
+_QUIZ_GEN_SYSTEM = """You are an expert engineering professor creating adaptive quiz questions.
+
+Return ONLY valid JSON:
 {
   "title": "Quiz title",
-  "difficulty": "easy|medium|hard",
-  "weakAreasDetected": ["topic1", "topic2"],
   "questions": [
     {
-      "questionText": "...",
-      "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+      "questionText": "Question text",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
       "correctIndex": 0,
-      "explanation": "Brief explanation of why this answer is correct",
+      "explanation": "Why the answer is correct",
       "difficulty": "easy|medium|hard",
-      "topic": "specific sub-topic"
+      "topic": "Specific sub-topic"
     }
   ]
 }
 
 Rules:
-- If student scored < 60% previously, generate 60% easy + 40% medium questions
-- If student scored 60-80%, generate 30% easy + 50% medium + 20% hard
-- If student scored > 80% or no history, generate 20% medium + 80% hard
-- Focus extra questions on topics where student got answers wrong
-- Questions must be specific and technically accurate for engineering students
-- Each option must be plausible (no obviously wrong answers)"""
+- Follow the requested difficulty distribution exactly as closely as possible.
+- Focus additional questions on the supplied weak topics.
+- Do not invent student performance or weak topics.
+- Questions must be technically accurate and unambiguous.
+- Each question must have four plausible options and exactly one correct answer.
+- Use the supplied course excerpts as the source of truth when provided.
+- Do not introduce facts that contradict the supplied course material.
+- Avoid repeating the same question in different wording.
+"""
 
 
 async def generate_adaptive_quiz(
@@ -198,52 +337,85 @@ async def generate_adaptive_quiz(
     user_id: int,
     body: AdaptiveQuizRequest,
 ) -> AdaptiveQuizResponse:
-    """Use GPT-4.1 to generate an adaptive quiz based on past attempt analysis."""
+    """Generate a quiz using the authenticated student's actual quiz history."""
     try:
         from src.safety.guard import scrub_pii
         from src.utils.llm import async_openai, chat_model_name
-        client = async_openai()
+
         topic = scrub_pii(body.topic)[0]
 
-        # Analyze past performance
-        avg_score = 0.0
-        weak_areas: list[str] = []
-        if body.pastAttempts:
-            scores = [a.score for a in body.pastAttempts]
-            avg_score = sum(scores) / len(scores)
+        profile = await _get_adaptive_performance(
+            db, user_id, topic, limit=5
+        )
 
-        # Determine target difficulty
-        difficulty = body.difficulty or "auto"
-        if difficulty == "auto":
-            if not body.pastAttempts:
-                difficulty = "medium"
-            elif avg_score < 60:
-                difficulty = "easy-medium"
-            elif avg_score < 80:
-                difficulty = "medium"
-            else:
-                difficulty = "hard"
+        requested_difficulty = body.difficulty or "auto"
+        difficulty = (
+            _select_adaptive_difficulty(profile["average_score"])
+            if requested_difficulty == "auto"
+            else requested_difficulty
+        )
 
-        attempts_text = ""
-        if body.pastAttempts:
-            attempts_text = f"\nPast performance on {topic}:\n"
-            for a in body.pastAttempts[-3:]:  # last 3 attempts
-                attempts_text += f"- {a.quizTitle}: {a.score:.0f}%\n"
-            attempts_text += f"Average score: {avg_score:.0f}%\n"
+        distributions = {
+            "easy": "70% easy, 30% medium",
+            "easy-medium": "50% easy, 50% medium",
+            "medium": "20% easy, 60% medium, 20% hard",
+            "medium-hard": "20% medium, 80% hard",
+            "hard": "100% hard",
+        }
+        distribution = distributions.get(difficulty, distributions["medium"])
+
+        attempts_text = "\n".join(
+            f"- {item['title']}: {item['score']:.1f}%"
+            for item in profile["attempts"]
+        ) or "No previous submitted attempts found for this topic."
+
+        weak_topics_text = (
+            ", ".join(profile["weak_areas"])
+            if profile["weak_areas"]
+            else "No weak topics identified yet."
+        )
+
+        topic_performance_text = json.dumps(
+            profile["topic_performance"], ensure_ascii=False
+        )
 
         from saarthi_backend.service.chat_service import _kb_excerpts
         excerpts = _kb_excerpts(topic)[:4000]
         grounding = (
-            f"\n\nCourse excerpts (base every question on these, with the course's own notation; add no outside facts):\n{excerpts}"
+            "\n\nCourse excerpts. Use these as the source of truth:\n"
+            + excerpts
             if excerpts else ""
         )
-        user_prompt = f"""Generate {body.numQuestions} adaptive quiz questions on: {topic}
-{"Course: " + body.courseTitle if body.courseTitle else ""}
-Target difficulty: {difficulty}{attempts_text}
 
-Focus on making questions that test deep understanding, not just memorization.
-For engineering students studying signals, systems, ML, or algorithms.{grounding}"""
+        user_prompt = f"""
+Generate exactly {body.numQuestions} adaptive quiz questions.
 
+Subject: {topic}
+Course: {body.courseTitle or "Not specified"}
+
+Target difficulty: {difficulty}
+Required difficulty distribution: {distribution}
+
+Recent verified student attempts:
+{attempts_text}
+
+Average recent score: {profile["average_score"]}
+Number of attempts analyzed: {profile["attempts_analyzed"]}
+
+Weak topics detected from individual answers:
+{weak_topics_text}
+
+Topic-level accuracy:
+{topic_performance_text}
+
+Give additional attention to weak topics while still covering the requested
+subject. Do not make every question about a single weak topic.
+
+Focus on conceptual understanding, application, and problem-solving.
+{grounding}
+"""
+
+        client = async_openai()
         response = await client.chat.completions.create(
             model=chat_model_name(),
             messages=[
@@ -251,32 +423,67 @@ For engineering students studying signals, systems, ML, or algorithms.{grounding
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.4,
-            max_tokens=3000,
+            max_tokens=4000,
             response_format={"type": "json_object"},
         )
 
         raw = response.choices[0].message.content or "{}"
         data = json.loads(raw)
 
-        questions = [
-            GeneratedQuizQuestion(
-                questionText=q["questionText"],
-                options=q.get("options", []),
-                correctIndex=int(q.get("correctIndex", 0)),
-                explanation=q.get("explanation", ""),
-                difficulty=q.get("difficulty", difficulty),
-                topic=q.get("topic", body.topic),
+        generated_questions = []
+        for question in data.get("questions", []):
+            if not isinstance(question, dict):
+                continue
+
+            question_text = question.get("questionText")
+            options = question.get("options")
+            correct_index = question.get("correctIndex")
+
+            if not isinstance(question_text, str) or not question_text.strip():
+                continue
+            if not isinstance(options, list) or len(options) != 4:
+                continue
+            if not all(isinstance(option, str) and option.strip() for option in options):
+                continue
+
+            try:
+                correct_index = int(correct_index)
+            except (TypeError, ValueError):
+                continue
+
+            if not 0 <= correct_index < len(options):
+                continue
+
+            question_difficulty = question.get("difficulty", "medium")
+            if question_difficulty not in ("easy", "medium", "hard"):
+                question_difficulty = "medium"
+
+            generated_questions.append(
+                GeneratedQuizQuestion(
+                    questionText=question_text.strip(),
+                    options=options,
+                    correctIndex=correct_index,
+                    explanation=str(question.get("explanation", "")),
+                    difficulty=question_difficulty,
+                    topic=str(question.get("topic") or topic),
+                )
             )
-            for q in data.get("questions", [])
-        ]
+
+        breakdown = {
+            level: sum(1 for q in generated_questions if q.difficulty == level)
+            for level in ("easy", "medium", "hard")
+        }
 
         return AdaptiveQuizResponse(
-            title=data.get("title", f"Adaptive Quiz: {body.topic}"),
-            topic=body.topic,
+            title=data.get("title", f"Adaptive Quiz: {topic}"),
+            topic=topic,
             difficulty=difficulty,
-            questions=questions,
-            weakAreasDetected=data.get("weakAreasDetected", weak_areas),
+            questions=generated_questions,
+            weakAreasDetected=profile["weak_areas"],
             generatedAt=datetime.now(timezone.utc).isoformat(),
+            averageScore=profile["average_score"],
+            attemptsAnalyzed=profile["attempts_analyzed"],
+            difficultyBreakdown=breakdown,
         )
 
     except Exception as e:
@@ -288,9 +495,10 @@ For engineering students studying signals, systems, ML, or algorithms.{grounding
             questions=[],
             weakAreasDetected=[],
             generatedAt=datetime.now(timezone.utc).isoformat(),
+            averageScore=None,
+            attemptsAnalyzed=0,
+            difficultyBreakdown={"easy": 0, "medium": 0, "hard": 0},
         )
-
-
 # ─── Peer Comparison ──────────────────────────────────────────────────────────
 
 async def get_peer_comparison(db: AsyncSession, user_id: int) -> PeerComparisonResponse:
