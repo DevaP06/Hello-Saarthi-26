@@ -1,5 +1,6 @@
 """search_index(): the hybrid search used by src.tools.retrieve for one index folder."""
 from __future__ import annotations
+from src.retrieval.query_expansion import expand_query
 
 import logging
 import os
@@ -62,6 +63,55 @@ def _neighbours(idx: store.LoadedIndex, i: int) -> list[int]:
     return out
 
 
+def _blend_weight() -> float:
+    """RERANK_BLEND: weight of the cross-encoder against the fused (RRF) order, 0..1. 1 = the reranker's
+    order replaces the fused order (the behaviour before 2026-11-16)."""
+    try:
+        return min(max(float(os.environ.get("RERANK_BLEND", "1")), 0.0), 1.0)
+    except ValueError:
+        return 1.0
+
+
+def _blend_order(fused_scores: list[float], rerank_scores: list[float], alpha: float) -> list[int]:
+    """Candidate positions ordered by alpha * reranker + (1 - alpha) * fused, both min-max scaled to 0..1."""
+    def scaled(xs: list[float]) -> list[float]:
+        lo, hi = min(xs), max(xs)
+        return [(x - lo) / (hi - lo) if hi > lo else 0.0 for x in xs]
+
+    r, f = scaled(rerank_scores), scaled(fused_scores)
+    combined = [alpha * a + (1 - alpha) * b for a, b in zip(r, f)]
+    return sorted(range(len(combined)), key=lambda j: combined[j], reverse=True)
+
+
+def _same_page_extra() -> int:
+    """RETRIEVAL_SAME_PAGE=n: up to n more chunks from the top chunk's page are moved up right after it
+    (a page split into several chunks is then shown whole). 0 = off."""
+    try:
+        return max(int(os.environ.get("RETRIEVAL_SAME_PAGE", "0")), 0)
+    except ValueError:
+        return 0
+
+
+def _page_key(md: dict) -> tuple | None:
+    page = md.get("page") if md.get("page") is not None else md.get("page_number")
+    owner = md.get("material_id") if md.get("material_id") is not None else md.get("source")
+    return (owner, page) if page is not None and owner is not None else None
+
+
+def _pull_same_page(idx: store.LoadedIndex, candidates: list, extra: int, top_k: int) -> list:
+    if not candidates:
+        return candidates
+    key = _page_key(idx.metadatas[candidates[0][0]])
+    if key is None:
+        return candidates
+    same = [c for c in candidates[1:] if _page_key(idx.metadatas[c[0]]) == key][: min(extra, max(top_k - 1, 0))]
+    if not same:
+        return candidates
+    moved = {c[0] for c in same}
+    rest = [c for c in candidates[1:] if c[0] not in moved]
+    return [candidates[0]] + [(i, s, f"{via}+page") for i, s, via in same] + rest
+
+
 def search_index(
     query: str,
     index_dir: Path,
@@ -79,21 +129,55 @@ def search_index(
 
     # Spec 4.2: dense k = 20 and BM25 k = 20, RRF, then rerank the fused top 30.
     pool = max(top_k * 4, _POOL_MIN)
-    legs = {l.strip() for l in os.environ.get("RETRIEVAL_LEGS", "dense,bm25").split(",") if l.strip()}
+        legs = {
+        l.strip()
+        for l in os.environ.get("RETRIEVAL_LEGS", "dense,bm25").split(",")
+        if l.strip()
+    }
+
+    use_multi_query = (
+        os.environ.get("MULTI_QUERY_RETRIEVAL", "0").lower()
+        in ("1", "true", "yes")
+    )
+
+    queries = expand_query(query) if use_multi_query else [query]
+
     rankings: dict[str, list[int]] = {}
-    if "dense" in legs:
-        try:
-            rankings["dense"] = _dense(idx, query, pool)
-            trace["legs"]["dense"] = len(rankings["dense"])
-        except Exception as e:
-            trace["legs"]["dense"] = f"error: {e}"
-            logger.warning("Dense leg failed for %s: %s", index_dir, e)
-    if "bm25" in legs:
-        try:
-            rankings["bm25"] = [i for i, _ in idx.bm25.top(query, pool)]
-            trace["legs"]["bm25"] = len(rankings["bm25"])
-        except Exception as e:
-            trace["legs"]["bm25"] = f"error: {e}"
+
+    for q_idx, search_query in enumerate(queries):
+
+        if "dense" in legs:
+            try:
+                name = f"dense_{q_idx}"
+                rankings[name] = _dense(idx, search_query, pool)
+                trace["legs"][name] = len(rankings[name])
+
+            except Exception as e:
+                trace["legs"][f"dense_{q_idx}"] = f"error: {e}"
+                logger.warning(
+                    "Dense retrieval failed for %s: %s",
+                    index_dir,
+                    e
+                )
+
+        if "bm25" in legs:
+            try:
+                name = f"bm25_{q_idx}"
+                rankings[name] = [
+                    i for i, _ in idx.bm25.top(search_query, pool)
+                ]
+                trace["legs"][name] = len(rankings[name])
+
+            except Exception as e:
+                trace["legs"][f"bm25_{q_idx}"] = f"error: {e}"
+                logger.warning(
+                    "BM25 retrieval failed for %s: %s",
+                    index_dir,
+                    e
+                )
+
+    if use_multi_query:
+        trace["expanded_queries"] = queries
 
     fused = _rrf({k: v for k, v in rankings.items() if v})
     if not fused:
@@ -113,13 +197,24 @@ def search_index(
     # Optional GPU legs reorder the fused candidate pool.
     candidates = fused[: max(pool, _RERANK_POOL)]
     texts = [idx.texts[i] for i, _, _ in candidates]
-    for name, fn in (("colbert", rerankers.colbert_order), ("rerank", rerankers.cross_encoder_order)):
-        order, status = fn(query, texts)
-        trace["legs"][name] = status
-        if order:
-            candidates = [candidates[j] for j in order] + [c for k, c in enumerate(candidates) if k not in set(order)]
-            candidates = [(i, s, f"{via}+{name}") for i, s, via in candidates]
-            texts = [idx.texts[i] for i, _, _ in candidates]
+    order, status = rerankers.colbert_order(query, texts)
+    trace["legs"]["colbert"] = status
+    if order:
+        candidates = [candidates[j] for j in order] + [c for k, c in enumerate(candidates) if k not in set(order)]
+        candidates = [(i, s, f"{via}+colbert") for i, s, via in candidates]
+        texts = [idx.texts[i] for i, _, _ in candidates]
+    scores, status = rerankers.cross_encoder_scores(query, texts)
+    trace["legs"]["rerank"] = status
+    if scores:
+        alpha = _blend_weight()
+        trace["rerank_blend"] = alpha
+        order = _blend_order([s for _, s, _ in candidates], scores, alpha)
+        candidates = [(candidates[j][0], candidates[j][1], f"{candidates[j][2]}+rerank") for j in order]
+
+    extra = _same_page_extra()
+    if extra:
+        candidates = _pull_same_page(idx, candidates, extra, top_k)
+        trace["same_page_extra"] = extra
 
     top = candidates[:top_k]
     if expand_via_graph is None:
