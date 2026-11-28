@@ -130,20 +130,40 @@ def search_index(
     # Spec 4.2: dense k = 20 and BM25 k = 20, RRF, then rerank the fused top 30.
     pool = max(top_k * 4, _POOL_MIN)
     legs = {l.strip() for l in os.environ.get("RETRIEVAL_LEGS", "dense,bm25").split(",") if l.strip()}
-    rankings: dict[str, list[int]] = {}
+    use_multi_query = (
+    os.environ.get("MULTI_QUERY_RETRIEVAL", "0").lower()
+    in ("1", "true", "yes")
+)
+
+queries = expand_query(query) if use_multi_query else [query]
+
+rankings: dict[str, list[int]] = {}
+
+for q_idx, search_query in enumerate(queries):
+
     if "dense" in legs:
         try:
-            rankings["dense"] = _dense(idx, query, pool)
-            trace["legs"]["dense"] = len(rankings["dense"])
+            name = f"dense_{q_idx}"
+            rankings[name] = _dense(idx, search_query, pool)
+            trace["legs"][name] = len(rankings[name])
+
         except Exception as e:
-            trace["legs"]["dense"] = f"error: {e}"
-            logger.warning("Dense leg failed for %s: %s", index_dir, e)
+            trace["legs"][f"dense_{q_idx}"] = f"error: {e}"
+            logger.warning("Dense retrieval failed: %s", e)
+
     if "bm25" in legs:
         try:
-            rankings["bm25"] = [i for i, _ in idx.bm25.top(query, pool)]
-            trace["legs"]["bm25"] = len(rankings["bm25"])
+            name = f"bm25_{q_idx}"
+            rankings[name] = [
+                i for i, _ in idx.bm25.top(search_query, pool)
+            ]
+            trace["legs"][name] = len(rankings[name])
+
         except Exception as e:
-            trace["legs"]["bm25"] = f"error: {e}"
+            trace["legs"][f"bm25_{q_idx}"] = f"error: {e}"
+
+if use_multi_query:
+    trace["expanded_queries"] = queries
 
     fused = _rrf({k: v for k, v in rankings.items() if v})
     if not fused:
